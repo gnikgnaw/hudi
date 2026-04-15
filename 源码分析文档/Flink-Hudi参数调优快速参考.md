@@ -128,14 +128,13 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `hoodie.write.batch.size` | 256MB | 64MB-2GB | 缓冲区大小，越大吞吐越高但延迟越高 |
-| `hoodie.write.buffer.limit.bytes` | 1GB | 512MB-8GB | 缓冲区最大限制，防止 OOM |
-| `hoodie.write.buffer.type` | MEMORY | MEMORY/SPILLABLE_DISK | 缓冲区类型，SPILLABLE_DISK 可溢出到磁盘 |
+| `write.batch.size` | 256（MB） | 64-2048 | 批缓冲区大小（MB），越大吞吐越高但延迟越高 |
+| `write.task.max.size` | 1024（MB） | 512-8192 | 单个写入任务最大内存（MB），超过阈值刷出最大 bucket，防止 OOM |
 
 **调优建议**：
-- 内存充足（16GB+）：`batch.size=1GB`, `limit=4GB`
-- 内存有限（4GB）：`batch.size=128MB`, `limit=512MB`, `type=SPILLABLE_DISK`
-- 低延迟：`batch.size=64MB`, `limit=256MB`
+- 内存充足（16GB+）：`write.batch.size=1024`, `write.task.max.size=4096`
+- 内存有限（4GB）：`write.batch.size=128`, `write.task.max.size=512`
+- 低延迟：`write.batch.size=64`, `write.task.max.size=256`
 
 ---
 
@@ -143,9 +142,9 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `hoodie.flink.write.tasks` | 4 | 1-64 | 写入任务数，越多吞吐越高但资源占用越多 |
-| `hoodie.index.bootstrap.tasks` | 4 | 1-32 | Bootstrap 任务数，一般为写入任务数的 1/2 |
-| `hoodie.flink.compaction.tasks` | 4 | 1-32 | Compaction 任务数，一般为写入任务数的 1/2 |
+| `write.tasks` | 无（取执行环境并行度） | 1-64 | 写入任务数，越多吞吐越高但资源占用越多 |
+| `write.index_bootstrap.tasks` | 无（同 write.tasks） | 1-32 | Bootstrap 任务数，一般为写入任务数的 1/2 |
+| `compaction.tasks` | 无（同 write.tasks） | 1-32 | Compaction 任务数，一般为写入任务数的 1/2 |
 
 **调优建议**：
 - 高吞吐：`write.tasks=CPU核数×2`, `bootstrap.tasks=CPU核数`, `compaction.tasks=CPU核数`
@@ -158,16 +157,16 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `hoodie.compaction.async.enabled` | false | 是否启用异步 Compaction |
-| `hoodie.compaction.strategy` | num_commits | Compaction 触发策略 |
-| `hoodie.compaction.num_commits` | 10 | 多少个 Commit 后触发 Compaction |
-| `hoodie.compaction.time_elapsed.minutes` | 60 | 多少分钟后触发 Compaction |
+| `compaction.async.enabled` | true | 是否启用异步 Compaction（MOR 表默认开启） |
+| `compaction.trigger.strategy` | num_commits | Compaction 触发策略（num_commits/time_elapsed/num_and_time/num_or_time） |
+| `compaction.delta_commits` | 5 | 多少个 delta commit 后触发 Compaction |
+| `compaction.delta_seconds` | 3600 | 多少秒后触发 Compaction（默认 1 小时） |
 
 **调优建议**：
-- 生产环境：必须启用 `async.enabled=true`
-- 读多写少：`num_commits=5`（频繁 Compaction）
-- 写多读少：`num_commits=20`（减少 Compaction）
-- 实时性要求高：`strategy=time_elapsed`, `time_elapsed.minutes=5`
+- 生产环境：默认已启用 `compaction.async.enabled=true`
+- 读多写少：`compaction.delta_commits=5`（频繁 Compaction）
+- 写多读少：`compaction.delta_commits=20`（减少 Compaction）
+- 实时性要求高：`compaction.trigger.strategy=time_elapsed`, `compaction.delta_seconds=300`
 
 ---
 
@@ -175,14 +174,13 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `hoodie.index.streaming.write.enabled` | false | 是否启用流式索引写入 |
-| `hoodie.index.type` | BLOOM | 索引类型：BLOOM/BUCKET/RECORD_INDEX |
+| `index.type` | FLINK_STATE | 索引类型：FLINK_STATE（默认）/BUCKET/GLOBAL_RECORD_LEVEL_INDEX |
 | `hoodie.index.bucket.engine` | SIMPLE | 桶引擎：SIMPLE/CONSISTENT_HASHING |
 
 **调优建议**：
-- 高并发 Upsert：`streaming.write.enabled=true`, `type=BUCKET`
-- 大表场景：`streaming.write.enabled=false`, `type=BLOOM`
-- 精确查询：`type=RECORD_INDEX`
+- 高并发 Upsert：`index.type=BUCKET`
+- 大表全局唯一场景：`index.type=GLOBAL_RECORD_LEVEL_INDEX`
+- 默认场景：`index.type=FLINK_STATE`（利用 Flink 状态后端）
 
 ---
 

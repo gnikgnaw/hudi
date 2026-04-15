@@ -641,8 +641,7 @@ private transient TotalSizeTracer tracer;
 
 // 配置参数
 - WRITE_BATCH_SIZE: 批处理大小（默认 256MB）
-- WRITE_BUFFER_SIZE: 缓冲区大小
-- WRITE_BUFFER_LIMIT_BYTES: 缓冲区限制
+- WRITE_TASK_MAX_SIZE: 单个写入任务最大内存（默认 1024MB）
 ```
 
 **为什么不直接使用 Java 堆内存？**

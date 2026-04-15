@@ -203,36 +203,36 @@ compaction.delta_commits=20
 
 ### Q: 吞吐量低怎么办？
 **A**: 按优先级尝试：
-1. 增加 `hoodie.write.batch.size` 到 512MB
-2. 增加 `hoodie.flink.write.tasks` 到 16
+1. 增加 `write.batch.size` 到 512
+2. 增加 `write.tasks` 到 16
 3. 增加 `execution.checkpointing.interval` 到 120000
 4. 检查网络和磁盘 I/O
 
 ### Q: 延迟高怎么办？
 **A**: 按优先级尝试：
-1. 减少 `hoodie.write.batch.size` 到 64MB
+1. 减少 `write.batch.size` 到 64
 2. 减少 `execution.checkpointing.interval` 到 30000
-3. 增加 `hoodie.compaction.num_commits` 到 5
-4. 启用 `hoodie.index.streaming.write.enabled=true`
+3. 减少 `compaction.delta_commits` 到 5
+4. 检查 Compaction 是否有积压
 
 ### Q: 内存溢出（OOM）怎么办？
 **A**: 按优先级尝试：
-1. 减少 `hoodie.write.batch.size` 到 128MB
-2. 减少 `hoodie.write.buffer.limit.bytes` 到 512MB
-3. 启用 `hoodie.write.buffer.type=SPILLABLE_DISK`
-4. 减少 `hoodie.flink.write.tasks` 到 4
+1. 减少 `write.batch.size` 到 128
+2. 减少 `write.task.max.size` 到 512
+3. 减少 `write.tasks` 到 4
+4. 增加 TaskManager 内存
 
 ### Q: 小文件太多怎么办？
 **A**: 按优先级尝试：
-1. 增加 `hoodie.write.batch.size` 到 512MB
-2. 减少 `hoodie.compaction.num_commits` 到 5
+1. 增加 `write.batch.size` 到 512
+2. 减少 `compaction.delta_commits` 到 5
 3. 增加 `execution.checkpointing.interval` 到 120000
 4. 手动执行 Compaction
 
 ### Q: Checkpoint 超时怎么办？
 **A**: 按优先级尝试：
 1. 增加 `execution.checkpointing.timeout` 到 1200000
-2. 减少 `hoodie.write.batch.size` 到 128MB
+2. 减少 `write.batch.size` 到 128
 3. 检查网络连接
 4. 增加 Checkpoint 间隔
 

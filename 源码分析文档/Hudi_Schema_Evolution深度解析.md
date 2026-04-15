@@ -9,7 +9,7 @@
 
 1. [总体架构概览](#1-总体架构概览)
 2. [InternalSchema 核心设计](#2-internalschema-核心设计)
-3. [SchemaEvolutionUtils 与 Schema 对齐算法](#3-schemaevolutionutils-与-schema-对齐算法)
+3. [AvroSchemaEvolutionUtils 与 Schema 对齐算法](#3-avroschemaevolutionutils-与-schema-对齐算法)
 4. [TableSchemaResolver：Schema 版本推导](#4-tableschemaresolver-schema-版本推导)
 5. [支持的 Schema 变更操作](#5-支持的-schema-变更操作)
 6. [读时 Schema 对齐（FileGroupReaderSchemaHandler）](#6-读时-schema-对齐filegroupreaderschemahandler)
@@ -166,7 +166,10 @@ Type (接口)
   |     +-- BooleanType, IntType, LongType, FloatType, DoubleType
   |     +-- DateType, TimeType, TimestampType
   |     +-- StringType, BinaryType, FixedType
-  |     +-- DecimalType, DecimalTypeBytes, DecimalTypeFixed
+  |     +-- DecimalBase (抽象类)
+  |     |     +-- DecimalTypeBytes
+  |     |     +-- DecimalTypeFixed
+  |     |           +-- DecimalType
   |     +-- UUIDType, VectorType
   |     +-- TimeMillisType, TimestampMillisType
   |     +-- LocalTimestampMillisType, LocalTimestampMicrosType
@@ -257,7 +260,7 @@ public Type refreshNewId(Type type, AtomicInteger nextId) {
 
 ---
 
-## 3. SchemaEvolutionUtils 与 Schema 对齐算法
+## 3. AvroSchemaEvolutionUtils 与 Schema 对齐算法
 
 ### 3.1 核心问题：Schema 对齐（Reconciliation）
 
@@ -379,7 +382,7 @@ public boolean isWiderThan(PrimitiveType other) {
 }
 ```
 
-Decimal 的升级需要同时满足：整数位不减少 AND 小数位不减少。此外，`DecimalTypeFixed` 还检查固定字节长度不能缩小。
+Decimal 的 `isWiderThan` 判断需要同时满足：整数位不减少 AND 小数位严格增大（`scale > dt.scale`）。在 `SchemaChangeUtils` 中，`isDecimalUpdateAllowInternalBase` 还额外允许 `precision >= src.precision && scale == src.scale` 的情况。此外，`DecimalTypeFixed` 还检查固定字节长度不能缩小。
 
 ---
 
@@ -994,9 +997,9 @@ public static final ConfigProperty<Boolean> RECONCILE_SCHEMA = ConfigProperty
 ### 7.4 SET_NULL_FOR_MISSING_COLUMNS 配置
 
 ```java
-public static final ConfigProperty<Boolean> SET_NULL_FOR_MISSING_COLUMNS = ConfigProperty
-    .key("hoodie.datasource.write.new.columns.nullable")
-    .defaultValue(false);
+public static final ConfigProperty<String> SET_NULL_FOR_MISSING_COLUMNS = ConfigProperty
+    .key("hoodie.write.set.null.for.missing.columns")
+    .defaultValue("false");
 ```
 
 当 incoming schema 缺少表中已有的列时，如果此配置为 true，缺失的列会被标记为 nullable。这在 Schema 频繁变化的流式写入场景中非常有用。

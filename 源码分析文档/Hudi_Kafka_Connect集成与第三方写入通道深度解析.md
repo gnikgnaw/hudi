@@ -464,6 +464,10 @@ public KafkaConnectTransactionServices(KafkaConnectConfigs connectConfigs) throw
         .setPayloadClassName(HoodieAvroPayload.class.getName())
         .setRecordKeyFields(recordKeyFields)
         .setPartitionFields(partitionColumns)
+        .setTableVersion(writeConfig.getWriteVersion())
+        .setTableFormat(connectConfigs.getStringOrDefault(HoodieTableConfig.TABLE_FORMAT))
+        .setKeyGeneratorClassProp(writeConfig.getKeyGeneratorClass())
+        .fromProperties(connectConfigs.getProps())
         .initTable(storageConf.newInstance(), tableBasePath));
 
     // 创建 HoodieJavaWriteClient
@@ -573,6 +577,7 @@ public class KafkaConnectWriterProvider implements ConnectWriterProvider<WriteSt
             .withCleanConfig(HoodieCleanConfig.newBuilder().withAutoClean(false).build())
             .withCompactionConfig(HoodieCompactionConfig.newBuilder().withInlineCompaction(false).build())
             .withClusteringConfig(HoodieClusteringConfig.newBuilder().withInlineClustering(false).build())
+            .withWritesFileIdEncoding(1)
             .build();
 
         hudiJavaClient = new HoodieJavaWriteClient<>(context, writeConfig);
@@ -1329,8 +1334,10 @@ public abstract class Source<T> implements SourceCommitCallback, Serializable {
 | `SqlSource` | `sources/SqlSource.java` | Spark SQL 查询 | ROW |
 | `HoodieIncrSource` | `sources/HoodieIncrSource.java` | 另一个 Hudi 表（增量） | ROW |
 | `S3EventsSource` | `sources/S3EventsSource.java` | AWS S3 事件 | ROW |
+| `S3EventsHoodieIncrSource` | `sources/S3EventsHoodieIncrSource.java` | S3 事件驱动增量拉取 | ROW |
 | `GcsEventsSource` | `sources/GcsEventsSource.java` | GCP GCS 事件 | ROW |
-| `PulsarSource` | `sources/PulsarSource.java` | Apache Pulsar | AVRO |
+| `GcsEventsHoodieIncrSource` | `sources/GcsEventsHoodieIncrSource.java` | GCS 事件驱动增量拉取 | ROW |
+| `PulsarSource` | `sources/PulsarSource.java` | Apache Pulsar | ROW |
 | `HiveIncrPullSource` | `sources/HiveIncrPullSource.java` | Hive 增量拉取 | AVRO |
 | `SqlFileBasedSource` | `sources/SqlFileBasedSource.java` | SQL 文件 | ROW |
 
@@ -1424,6 +1431,7 @@ public abstract class SchemaProvider implements Serializable {
 | SchemaProvider | 源码路径 | Schema 来源 |
 |---------------|----------|-------------|
 | `FilebasedSchemaProvider` | `schema/FilebasedSchemaProvider.java` | DFS 文件（Avro Schema JSON） |
+| `SchemaRegistryProvider` | `schema/SchemaRegistryProvider.java` | Confluent Schema Registry |
 | `HiveSchemaProvider` | `schema/HiveSchemaProvider.java` | Hive Metastore |
 | `JdbcbasedSchemaProvider` | `schema/JdbcbasedSchemaProvider.java` | JDBC 数据库 |
 | `ProtoClassBasedSchemaProvider` | `schema/ProtoClassBasedSchemaProvider.java` | Protobuf Class |

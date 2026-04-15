@@ -288,16 +288,17 @@ Hudi 支持多种索引类型，每种的查找效率不同：
 
 ```java
 public enum IndexType {
-    INMEMORY,              // 内存哈希，适合小表
-    BLOOM,                 // Bloom Filter，适合 COW
-    GLOBAL_BLOOM,          // 全局 Bloom Filter
-    SIMPLE,                // 全量 Join，最简单但最慢
-    GLOBAL_SIMPLE,         // 全局全量 Join
-    BUCKET,                // 桶索引，O(1) 查找
-    FLINK_STATE,           // Flink 状态后端
-    RECORD_INDEX,          // 已废弃，使用 GLOBAL_RECORD_LEVEL_INDEX
-    GLOBAL_RECORD_LEVEL_INDEX,  // 全局记录级索引
-    RECORD_LEVEL_INDEX     // 分区级记录级索引
+    INMEMORY,                   // 内存哈希，适合小表
+    BLOOM,                      // Bloom Filter，分区内唯一
+    GLOBAL_BLOOM,               // 全局 Bloom Filter，全表唯一
+    SIMPLE,                     // 全量 Join，分区内唯一
+    GLOBAL_SIMPLE,              // 全局全量 Join，全表唯一
+    BUCKET,                     // 桶索引，O(1) 查找
+    FLINK_STATE,                // Flink 状态后端
+    @Deprecated
+    RECORD_INDEX,               // 已废弃，使用 GLOBAL_RECORD_LEVEL_INDEX 或 RECORD_LEVEL_INDEX
+    GLOBAL_RECORD_LEVEL_INDEX,  // 全局记录级索引（全表唯一键）
+    RECORD_LEVEL_INDEX          // 分区级记录级索引（分区内唯一键）
 }
 ```
 
@@ -772,8 +773,8 @@ public abstract class CompactionStrategy implements IncrementalPartitionAwareStr
         List<HoodieCompactionOperation> operations, 
         List<HoodieCompactionPlan> pendingCompactionPlans, ...);
     
-    // 核心方法：排序和过滤 Compaction 操作
-    public abstract Pair<List<HoodieCompactionOperation>, List<String>> orderAndFilter(
+    // 核心方法：排序和过滤 Compaction 操作（有默认实现，子类可覆盖）
+    public Pair<List<HoodieCompactionOperation>, List<String>> orderAndFilter(
         HoodieWriteConfig writeConfig,
         List<HoodieCompactionOperation> operations,
         List<HoodieCompactionPlan> pendingCompactionPlans);
@@ -805,8 +806,8 @@ Clustering 用于重新组织数据文件的物理布局，优化查询性能。
 ```java
 public abstract class ClusteringExecutionStrategy<T, I, K, O> implements Serializable {
     // 执行 Clustering 操作
-    public abstract HoodieData<WriteStatus> performClustering(
-        HoodieData<HoodieRecord<T>> inputRecords, int numOutputGroups, ...);
+    public abstract HoodieWriteMetadata<O> performClustering(
+        final HoodieClusteringPlan clusteringPlan, final HoodieSchema schema, final String instantTime);
 }
 ```
 

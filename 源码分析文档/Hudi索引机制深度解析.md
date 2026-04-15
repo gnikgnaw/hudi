@@ -142,7 +142,7 @@ canIndexLogFiles = true (Bucket/RLI/Flink State):
 
 ```java
 public enum IndexType {
-    INMEMORY,                    // 内存 HashMap（默认 Flink/Java 引擎）
+    INMEMORY,                    // 内存 HashMap（默认 Java 引擎；Flink 通过 FlinkOptions 覆盖为 FLINK_STATE）
     BLOOM,                       // Bloom Filter（分区内唯一）
     GLOBAL_BLOOM,                // 全局 Bloom Filter
     SIMPLE,                      // 全量 Key 扫描（默认 Spark 引擎）
@@ -626,7 +626,7 @@ Flink StreamWriteFunction 中:
 | RLI | 分区内 | 是 | 否 | Metadata Table | O(1) 查表 | 无限 | Spark |
 | GLOBAL_RLI | 全局 | 是 | 否 | Metadata Table | O(1) 查表 | 无限 | Spark |
 | FLINK_STATE | 全局 | 是 | 否 | Flink State | O(1) 本地 | 无限 | Flink |
-| INMEMORY | 分区内 | 否 | 否 | 无 | O(1) 内存 | < 100 万 | Flink/Java |
+| INMEMORY | 全局 | 否 | 否 | 无 | O(1) 内存 | < 100 万 | Flink/Java |
 
 ### 8.2 选型决策树
 

@@ -7,19 +7,19 @@
 #### 高吞吐场景（TB 级数据，追求最大吞吐）
 ```properties
 # 缓冲区配置
-hoodie.write.batch.size=1GB
-hoodie.write.buffer.limit.bytes=4GB
+write.batch.size=1024
+write.task.max.size=4096
 
 # 并行度配置
-hoodie.flink.write.tasks=32
-hoodie.index.bootstrap.tasks=16
+write.tasks=32
+write.index_bootstrap.tasks=16
 
 # Checkpoint 配置
 execution.checkpointing.interval=120000
 
 # Compaction 配置
-hoodie.compaction.async.enabled=true
-hoodie.compaction.num_commits=20
+compaction.async.enabled=true
+compaction.delta_commits=20
 ```
 
 **预期效果**：
@@ -32,19 +32,19 @@ hoodie.compaction.num_commits=20
 #### 低延迟场景（秒级数据可见性）
 ```properties
 # 缓冲区配置
-hoodie.write.batch.size=64MB
-hoodie.write.buffer.limit.bytes=512MB
+write.batch.size=64
+write.task.max.size=512
 
 # 并行度配置
-hoodie.flink.write.tasks=8
-hoodie.index.bootstrap.tasks=4
+write.tasks=8
+write.index_bootstrap.tasks=4
 
 # Checkpoint 配置
 execution.checkpointing.interval=30000
 
 # Compaction 配置
-hoodie.compaction.async.enabled=true
-hoodie.compaction.num_commits=5
+compaction.async.enabled=true
+compaction.delta_commits=5
 ```
 
 **预期效果**：
@@ -57,20 +57,19 @@ hoodie.compaction.num_commits=5
 #### 内存紧张场景（内存有限，需要稳定运行）
 ```properties
 # 缓冲区配置
-hoodie.write.batch.size=128MB
-hoodie.write.buffer.limit.bytes=512MB
-hoodie.write.buffer.type=SPILLABLE_DISK
+write.batch.size=128
+write.task.max.size=512
 
 # 并行度配置
-hoodie.flink.write.tasks=4
-hoodie.index.bootstrap.tasks=2
+write.tasks=4
+write.index_bootstrap.tasks=2
 
 # Checkpoint 配置
 execution.checkpointing.interval=60000
 
 # Compaction 配置
-hoodie.compaction.async.enabled=true
-hoodie.compaction.num_commits=10
+compaction.async.enabled=true
+compaction.delta_commits=10
 ```
 
 **预期效果**：
@@ -83,17 +82,16 @@ hoodie.compaction.num_commits=10
 #### 读多写少场景（优化读取性能）
 ```properties
 # 缓冲区配置
-hoodie.write.batch.size=256MB
-hoodie.write.buffer.limit.bytes=1GB
+write.batch.size=256
+write.task.max.size=1024
 
 # 索引配置
-hoodie.index.streaming.write.enabled=true
 hoodie.index.type=BUCKET
 
 # Compaction 配置
-hoodie.compaction.async.enabled=true
-hoodie.compaction.strategy=num_commits
-hoodie.compaction.num_commits=5
+compaction.async.enabled=true
+compaction.trigger.strategy=num_commits
+compaction.delta_commits=5
 ```
 
 **预期效果**：
@@ -106,15 +104,15 @@ hoodie.compaction.num_commits=5
 #### 写多读少场景（优化写入性能）
 ```properties
 # 缓冲区配置
-hoodie.write.batch.size=512MB
-hoodie.write.buffer.limit.bytes=2GB
+write.batch.size=512
+write.task.max.size=2048
 
 # 并行度配置
-hoodie.flink.write.tasks=16
+write.tasks=16
 
 # Compaction 配置
-hoodie.compaction.async.enabled=true
-hoodie.compaction.num_commits=20
+compaction.async.enabled=true
+compaction.delta_commits=20
 ```
 
 **预期效果**：

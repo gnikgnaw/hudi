@@ -240,10 +240,10 @@ KeyGeneratorInterface (接口)
               └── AutoRecordGenWrapperAvroKeyGenerator (hudi-client-common)
 
 Spark 特化版本（位于 hudi-spark-client）:
-  BuiltinKeyGenerator (抽象类)
+  BuiltinKeyGenerator (抽象类, 继承 BaseKeyGenerator)
     ├── SimpleKeyGenerator
+    │     └── TimestampBasedKeyGenerator
     ├── ComplexKeyGenerator
-    ├── TimestampBasedKeyGenerator
     ├── NonpartitionedKeyGenerator
     ├── CustomKeyGenerator
     ├── GlobalDeleteKeyGenerator
@@ -633,15 +633,13 @@ HoodieIOHandle (基类 - 持有 config, instantTime, hoodieTable)
   └── HoodieWriteHandle (写入基类)
         │
         ├── BaseCreateHandle (创建新文件)
-        │     ├── HoodieCreateHandle (通用创建)
-        │     ├── HoodieUnboundedCreateHandle (不限大小创建)
-        │     ├── HoodieBootstrapHandle (Bootstrap 创建)
-        │     └── HoodieBinaryCopyHandle (二进制复制)
-        │     
-        │     Flink 特化:
-        │     ├── FlinkCreateHandle
-        │     ├── HoodieRowDataCreateHandle
-        │     └── HoodieRowCreateHandle (Spark Row)
+        │     └── HoodieCreateHandle (通用创建)
+        │           ├── HoodieUnboundedCreateHandle (不限大小创建)
+        │           ├── HoodieBootstrapHandle (Bootstrap 创建)
+        │           │
+        │           └── FlinkCreateHandle (Flink 特化)
+        │
+        ├── HoodieBinaryCopyHandle (二进制复制, 直接继承 HoodieWriteHandle)
         │
         ├── HoodieAbstractMergeHandle (合并基类, 实现 HoodieMergeHandle 接口)
         │     │
@@ -668,6 +666,10 @@ HoodieIOHandle (基类 - 持有 config, instantTime, hoodieTable)
               
               Flink 特化:
               └── FlinkAppendHandle
+
+独立类（不在 WriteHandle 继承体系中）:
+  HoodieRowCreateHandle (Spark, 位于 hudi-spark-client, 实现 Serializable)
+  HoodieRowDataCreateHandle (Flink, 位于 hudi-flink-client, 实现 Serializable)
 ```
 
 ### 4.3 IOType — 三种底层 IO 类型
@@ -946,12 +948,13 @@ Flink 环境下有一套独立的 Handle 体系，主要区别在于：
 ### 4.10 WriteHandleFactory — Handle 工厂体系
 
 ```
-WriteHandleFactory (接口)
+WriteHandleFactory (抽象类)
   ├── CreateHandleFactory         → 创建 HoodieCreateHandle
-  ├── SingleFileHandleCreateFactory → 单文件创建
+  │     └── SingleFileHandleCreateFactory → 单文件创建
   ├── AppendHandleFactory         → 创建 HoodieAppendHandle
-  ├── FlinkWriteHandleFactory     → Flink 写入 handle 工厂
-  └── ExplicitWriteHandleFactory  → 显式指定 handle 的工厂
+  ├── BinaryCopyHandleFactory     → 创建 HoodieBinaryCopyHandle
+  ├── FlinkWriteHandleFactory     → Flink 写入 handle 工厂 (位于 hudi-flink-client)
+  └── ExplicitWriteHandleFactory  → 显式指定 handle 的工厂 (位于 hudi-flink-client)
 ```
 
 ---

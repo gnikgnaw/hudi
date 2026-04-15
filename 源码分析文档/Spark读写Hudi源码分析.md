@@ -72,6 +72,8 @@ DefaultSource extends RelationProvider
                  with DataSourceRegister     // shortName() = "hudi_v1"
                  with StreamSinkProvider     // Structured Streaming Sink
                  with StreamSourceProvider   // Structured Streaming Source
+                 with SparkAdapterSupport
+                 with Serializable
 ```
 
 `BaseDefaultSource` 仅仅是一个薄包装，注册 `shortName = "hudi"`，实际逻辑全在 `DefaultSource` 中。
@@ -149,7 +151,8 @@ class DefaultSource extends RelationProvider
     with DataSourceRegister
     with StreamSinkProvider      // ★ 同时支持 Streaming Sink
     with StreamSourceProvider    // ★ 同时支持 Streaming Source
-    with SparkAdapterSupport {
+    with SparkAdapterSupport
+    with Serializable {
 
   override def shortName(): String = "hudi_v1"
 
@@ -517,7 +520,10 @@ class HoodieFileGroupReaderBasedFileFormat(
     isMultipleBaseFileFormatsEnabled: Boolean,
     hoodieFileFormat: HoodieFileFormat)
   extends ParquetFileFormat            // ★ 继承 Spark 原生 Parquet 格式
-  with HoodieFormatTrait {
+  with SparkAdapterSupport
+  with HoodieFormatTrait
+  with Logging
+  with Serializable {
 
   // 核心方法：构建记录 reader
   override def buildReaderWithPartitionValues(

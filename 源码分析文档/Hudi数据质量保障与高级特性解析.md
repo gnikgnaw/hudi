@@ -34,13 +34,19 @@
 ### 1.2 核心类层级
 
 ```
-BasePreCommitValidator (hudi-common，引擎无关)
-  └── SparkPreCommitValidator<T,I,K,O> (hudi-spark-client，Spark 特化)
-        └── SqlQueryPreCommitValidator (基于 SQL 查询的抽象基类)
-              ├── SqlQueryEqualityPreCommitValidator     (前后相等校验)
-              ├── SqlQueryInequalityPreCommitValidator    (前后不等校验)
-              └── SqlQuerySingleResultPreCommitValidator  (单值结果校验)
+SparkPreCommitValidator<T,I,K,O> (hudi-spark-client，Spark 特化抽象基类)
+  └── SqlQueryPreCommitValidator<T,I,K,O> (基于 SQL 查询的抽象基类)
+        ├── SqlQueryEqualityPreCommitValidator     (前后相等校验)
+        ├── SqlQueryInequalityPreCommitValidator    (前后不等校验)
+        └── SqlQuerySingleResultPreCommitValidator  (单值结果校验)
+
+BasePreCommitValidator (hudi-common，引擎无关的新框架基类，与上述体系独立)
 ```
+
+注意：`BasePreCommitValidator` 是 hudi-common 中新引入的引擎无关验证框架基类，
+它与 Spark 特化的 `SparkPreCommitValidator` 体系是**独立并行**的两条路径。
+`SparkPreCommitValidator` 不继承 `BasePreCommitValidator`。
+在未来的 Phase 3 中，两者可能会进行整合。
 
 **源码位置**：
 - `hudi-common/.../client/validator/BasePreCommitValidator.java`

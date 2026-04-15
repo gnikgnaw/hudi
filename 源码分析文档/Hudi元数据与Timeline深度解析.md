@@ -210,12 +210,15 @@ public class HoodieInstant implements Serializable, Comparable<HoodieInstant> {
 | `commit` | COW 写入 | COW | `HoodieCommitMetadata` |
 | `deltacommit` | MOR 写入 | MOR | `HoodieCommitMetadata` |
 | `compaction` | Compaction | MOR | `HoodieCompactionPlan` (requested), `HoodieCommitMetadata` (completed) |
+| `logcompaction` | Log Compaction（合并 log 文件） | MOR | 类似 compaction |
 | `clean` | 文件清理 | 两种 | `HoodieCleanerPlan` / `HoodieCleanMetadata` |
 | `rollback` | 回滚 | 两种 | `HoodieRollbackPlan` / `HoodieRollbackMetadata` |
 | `savepoint` | 保存点 | 两种 | `HoodieSavepointMetadata` |
 | `restore` | 恢复到保存点 | 两种 | `HoodieRestorePlan` / `HoodieRestoreMetadata` |
 | `replacecommit` | 替换提交(Clustering/INSERT_OVERWRITE) | 两种 | `HoodieReplaceCommitMetadata` |
+| `clustering` | Clustering（V2 独立 action，V1 使用 replacecommit） | 两种 | `HoodieReplaceCommitMetadata` |
 | `indexing` | 索引构建 | 两种 | `HoodieIndexPlan` / `HoodieIndexCommitMetadata` |
+| `schemacommit` | Schema 保存（仅用于 schema 变更记录） | 两种 | - |
 
 ---
 
@@ -253,10 +256,10 @@ TableFileSystemView (接口)
 
 实现类层次:
 AbstractTableFileSystemView (抽象基类)
-    ├── HoodieTableFileSystemView        ← ★ 基于内存 HashMap
-    ├── SpillableMapBasedFileSystemView  ← 内存+磁盘溢写
-    ├── RocksDbBasedFileSystemView       ← 基于 RocksDB
-    └── IncrementalTimelineSyncFileSystemView ← 增量同步
+    └── IncrementalTimelineSyncFileSystemView (抽象类，增量同步)
+        ├── HoodieTableFileSystemView        ← ★ 基于内存 HashMap
+        │   └── SpillableMapBasedFileSystemView  ← 内存+磁盘溢写
+        └── RocksDbBasedFileSystemView       ← 基于 RocksDB
 
 RemoteHoodieTableFileSystemView          ← 远程视图（调用 Timeline Server API）
 

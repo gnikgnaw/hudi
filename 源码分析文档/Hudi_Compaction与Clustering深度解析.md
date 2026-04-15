@@ -233,23 +233,30 @@ Compaction 后:
 ```
 继承层次:
 CompactionStrategy (抽象基类)
-    ├── UnBoundedCompactionStrategy (不限制 I/O)
-    │   └── LogFileSizeBasedCompactionStrategy (★ 默认策略)
     ├── BoundedIOCompactionStrategy (限制 I/O 上限)
-    ├── DayBasedCompactionStrategy (按天选分区)
+    │   ├── LogFileSizeBasedCompactionStrategy (★ 默认策略)
+    │   ├── LogFileNumBasedCompactionStrategy (按 log 文件数)
+    │   └── DayBasedCompactionStrategy (按天选分区)
+    │       └── BoundedPartitionAwareCompactionStrategy (有界分区感知)
+    ├── UnBoundedCompactionStrategy (不限制 I/O)
     ├── UnBoundedPartitionAwareCompactionStrategy (不限制，按分区感知)
-    └── LogFileNumBasedCompactionStrategy (按 log 文件数)
+    ├── CompositeCompactionStrategy (组合策略，串联多个策略)
+    └── PartitionRegexBasedCompactionStrategy (按正则匹配分区)
 ```
 
-**纠错**：原文档遗漏了 `LogFileNumBasedCompactionStrategy`（按 log 文件数量筛选）。
+**纠错**：原文档遗漏了 `LogFileNumBasedCompactionStrategy`（按 log 文件数量筛选）、`BoundedPartitionAwareCompactionStrategy`（有界分区感知）、`CompositeCompactionStrategy`（组合策略）和 `PartitionRegexBasedCompactionStrategy`（正则分区）。同时 `LogFileSizeBasedCompactionStrategy` 和 `DayBasedCompactionStrategy` 实际继承自 `BoundedIOCompactionStrategy` 而非 `UnBoundedCompactionStrategy` 或直接继承 `CompactionStrategy`。
 
 | 策略 | 筛选条件 | 排序方式 | I/O 限制 | 适用场景 |
 |------|---------|---------|---------|---------|
 | `LogFileSizeBasedCompactionStrategy` (默认) | log 总大小 ≥ 阈值 | log 大小降序 | 有（继承 BoundedIO） | **通用场景** |
-| `LogFileNumBasedCompactionStrategy` | log 文件数 ≥ 阈值 | log 文件数降序 | 有 | 文件数敏感场景 |
+| `LogFileNumBasedCompactionStrategy` | log 文件数 ≥ 阈值 | log 文件数降序 | 有（继承 BoundedIO） | 文件数敏感场景 |
+| `DayBasedCompactionStrategy` | 按天过滤分区 | 分区路径排序 | 有（继承 BoundedIO） | 按天调度 |
+| `BoundedPartitionAwareCompactionStrategy` | 按天过滤 + 分区感知 | 分区路径排序 | 有（继承 DayBased→BoundedIO） | 限制 I/O 的分区感知 |
 | `BoundedIOCompactionStrategy` | 无 | 无特殊排序 | 有 | 控制资源消耗 |
 | `UnBoundedCompactionStrategy` | 无 | 无特殊排序 | 无 | 全量 Compaction |
-| `DayBasedCompactionStrategy` | 按天过滤分区 | 分区路径排序 | 无 | 按天调度 |
+| `UnBoundedPartitionAwareCompactionStrategy` | 按分区感知 | 无特殊排序 | 无 | 不限 I/O 的分区感知 |
+| `CompositeCompactionStrategy` | 组合多个策略 | 依赖子策略 | 依赖子策略 | 组合场景 |
+| `PartitionRegexBasedCompactionStrategy` | 按正则匹配分区名 | 无特殊排序 | 无 | 按正则选择分区 |
 
 **默认策略 LogFileSizeBasedCompactionStrategy 的工作流程**：
 
@@ -353,15 +360,17 @@ ClusteringPlanStrategy (抽象基类)
     ├── BaseConsistentHashingBucketClusteringPlanStrategy (一致性哈希桶调整)
     └── (引擎特定实现)
         ├── SparkSizeBasedClusteringPlanStrategy (★ Spark 默认)
+        │   ├── SparkStreamCopyClusteringPlanStrategy
+        │   └── SparkSingleFileSortPlanStrategy (单文件排序)
         ├── SparkConsistentBucketClusteringPlanStrategy
-        ├── SparkStreamCopyClusteringPlanStrategy
         ├── FlinkSizeBasedClusteringPlanStrategy (Flink 默认)
-        ├── FlinkSkipSingleFileClusteringPlanStrategy
-        ├── FlinkSizeBasedClusteringPlanStrategyRecently
+        │   ├── FlinkSkipSingleFileClusteringPlanStrategy
+        │   └── FlinkSizeBasedClusteringPlanStrategyRecently
+        ├── FlinkConsistentBucketClusteringPlanStrategy
         └── JavaSizeBasedClusteringPlanStrategy
 ```
 
-**纠错**：原文档遗漏了多个 Clustering Plan Strategy 实现，特别是 Flink 侧的 `FlinkSkipSingleFileClusteringPlanStrategy` 和 `FlinkSizeBasedClusteringPlanStrategyRecently`。
+**纠错**：原文档遗漏了多个 Clustering Plan Strategy 实现，特别是 Flink 侧的 `FlinkSkipSingleFileClusteringPlanStrategy`、`FlinkSizeBasedClusteringPlanStrategyRecently` 和 `FlinkConsistentBucketClusteringPlanStrategy`，以及 Spark 侧的 `SparkSingleFileSortPlanStrategy`。同时修正了继承关系：`SparkStreamCopyClusteringPlanStrategy` 和 `SparkSingleFileSortPlanStrategy` 实际继承自 `SparkSizeBasedClusteringPlanStrategy`。
 
 ### 4.4 排序策略 —— 为什么排序很重要？
 
@@ -741,9 +750,11 @@ ClusteringExecutionStrategy<T, I, K, O> (抽象基类)
     │   │   ├── SparkSortAndSizeExecutionStrategy<T> (★ Spark 默认，排序+大小优化)
     │   │   │   ├── SparkBinaryCopyClusteringExecutionStrategy<T> (二进制流拷贝优化)
     │   │   │   │   └── SparkStreamCopyClusteringExecutionStrategy<T> (流式拷贝，跳过 Schema 检查)
-    │   │   └── SparkConsistentBucketClusteringExecutionStrategy<T> (一致性哈希桶 Clustering)
+    │   │   ├── SparkConsistentBucketClusteringExecutionStrategy<T> (一致性哈希桶 Clustering)
+    │   │   └── SparkSingleFileSortExecutionStrategy<T> (单文件排序策略)
     │   │
     │   └── SingleSparkJobExecutionStrategy<T> (单 Spark Job 执行，所有 ClusteringGroup 在一个作业中)
+    │       └── SingleSparkJobConsistentHashingExecutionStrategy<T> (单 Job 一致性哈希)
     │
     ├── [Java 引擎]
     │   └── JavaExecutionStrategy<T> (Java 引擎基类)

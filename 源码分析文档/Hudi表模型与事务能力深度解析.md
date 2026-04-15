@@ -756,13 +756,14 @@ public class LockManager implements Serializable, AutoCloseable {
 | `InProcessLockProvider` | hudi-common | JVM 内 `ReentrantReadWriteLock` | 单 Writer（默认）|
 | `FileSystemBasedLockProvider` | hudi-client-common | 基于文件系统的锁 | 简单分布式场景 |
 | `StorageBasedLockProvider` | hudi-client-common | 基于存储层的锁 | 通用分布式场景 |
-| `BaseZookeeperBasedLockProvider` | hudi-client-common | 基于 ZooKeeper 的分布式锁 | 多 Writer 标准方案 |
+| `ZookeeperBasedLockProvider` | hudi-client-common | 基于 ZooKeeper 的分布式锁（继承 `BaseZookeeperBasedLockProvider`） | 多 Writer 标准方案 |
+| `ZookeeperBasedImplicitBasePathLockProvider` | hudi-client-common | 基于 ZooKeeper 的分布式锁（自动推断 lock path） | 多 Writer 简化配置 |
 | `HiveMetastoreBasedLockProvider` | hudi-hive-sync | 基于 Hive Metastore 的锁 | Hive 集成场景 |
-| `DynamoDBBasedLockProviderBase` | hudi-aws | 基于 AWS DynamoDB 的锁 | AWS 场景 |
+| `DynamoDBBasedLockProvider` | hudi-aws | 基于 AWS DynamoDB 的锁（继承 `DynamoDBBasedLockProviderBase`） | AWS 场景 |
 | `NoopLockProvider` | hudi-common | 空操作锁（不加锁）| 测试/调试 |
 | 自定义实现 | 用户代码 | 用户实现 `LockProvider` 接口 | 特殊需求 |
 
-**纠错说明**：原文档中的 `ZookeeperBasedLockProvider` 实际名称为 `BaseZookeeperBasedLockProvider`，`HiveMetastoreLockProvider` 实际名称为 `HiveMetastoreBasedLockProvider`。
+**说明**：`BaseZookeeperBasedLockProvider` 和 `DynamoDBBasedLockProviderBase` 是抽象基类，用户配置时应使用具体实现类 `ZookeeperBasedLockProvider` 和 `DynamoDBBasedLockProvider`。
 
 ### 9.3 锁配置最佳实践
 
@@ -771,7 +772,7 @@ public class LockManager implements Serializable, AutoCloseable {
 # hoodie.write.lock.provider 默认为 InProcessLockProvider
 
 # === 多 Writer — ZooKeeper 方案 ===
-hoodie.write.lock.provider=org.apache.hudi.client.transaction.lock.BaseZookeeperBasedLockProvider
+hoodie.write.lock.provider=org.apache.hudi.client.transaction.lock.ZookeeperBasedLockProvider
 hoodie.write.lock.zookeeper.url=zk-host:2181
 hoodie.write.lock.zookeeper.port=2181
 hoodie.write.lock.zookeeper.lock_key=my_table_lock

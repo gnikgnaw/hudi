@@ -264,7 +264,7 @@ public class LockManager implements Serializable, AutoCloseable {
 }
 ```
 
-**为什么使用 `volatile` 修饰 `lockProvider`**：因为 `getLockProvider()` 方法使用了 DCL（Double-Checked Locking）模式进行懒加载。`volatile` 保证了多线程环境下对 `lockProvider` 引用的可见性，防止出现对象半初始化的问题。
+**为什么使用 `volatile` 修饰 `lockProvider`**：虽然 `getLockProvider()` 方法使用了 `synchronized` 关键字来保证懒加载的线程安全，但 `closeQuietly()` 方法会将 `lockProvider` 置为 `null`，而 `close()` 可能从其他线程调用。`volatile` 保证了多线程环境下对 `lockProvider` 引用的可见性，确保一个线程将其置为 `null` 后，其他线程能立即看到更新。
 
 #### 3.3 构造函数解析
 
@@ -394,7 +394,7 @@ private void closeQuietly() {
 
 ### 4. 所有 LockProvider 实现的深度对比
 
-Hudi 提供了 7 种 LockProvider 实现，覆盖了从进程内到云原生的各种场景。
+Hudi 提供了 7 种 LockProvider 实现（含 2 个抽象基类和它们的具体子类，共 9 个具体实现），覆盖了从进程内到云原生的各种场景。
 
 #### 4.1 InProcessLockProvider
 
@@ -646,6 +646,10 @@ this.curatorFrameworkClient.start();
 
 **好处**：ZK 的分布式锁是业界标准方案，成熟可靠。Session 机制天然处理了客户端崩溃的问题——session 超时后锁自动释放。
 
+**具体子类**：
+- `ZookeeperBasedLockProvider`（`hudi-client/hudi-client-common/.../lock/ZookeeperBasedLockProvider.java`）：需要用户显式配置 ZK base path 和 lock key。
+- `ZookeeperBasedImplicitBasePathLockProvider`（`hudi-client/hudi-client-common/.../lock/ZookeeperBasedImplicitBasePathLockProvider.java`）：自动从表的 base path 推导 ZK 路径，无需显式配置 base path 和 lock key。
+
 #### 4.5 HiveMetastoreBasedLockProvider
 
 **源码路径**：`hudi-sync/hudi-hive-sync/src/main/java/org/apache/hudi/hive/transaction/lock/HiveMetastoreBasedLockProvider.java`
@@ -745,6 +749,10 @@ public boolean tryLock(long time, TimeUnit unit) {
 
 **好处**：DynamoDB 是 Serverless 的全托管服务，无需运维。心跳由 AWS Lock Client 自动管理。与 S3 生态天然配合。
 
+**具体子类**：
+- `DynamoDBBasedLockProvider`（`hudi-aws/.../lock/DynamoDBBasedLockProvider.java`）：需要用户显式配置 DynamoDB partition key。
+- `DynamoDBBasedImplicitPartitionKeyLockProvider`（`hudi-aws/.../lock/DynamoDBBasedImplicitPartitionKeyLockProvider.java`）：自动从表的 base path 推导 partition key，无需显式配置。
+
 #### 4.7 NoopLockProvider
 
 **源码路径**：`hudi-common/src/main/java/org/apache/hudi/client/transaction/lock/NoopLockProvider.java`
@@ -773,9 +781,11 @@ public class NoopLockProvider implements LockProvider<ReentrantReadWriteLock>, S
 | InProcessLockProvider | 无 | 任何 | 最低(ns) | 仅进程内 | 无 |
 | FileSystemBasedLockProvider | 无 | HDFS/支持原子创建的FS | 低(ms) | 中 | 低 |
 | StorageBasedLockProvider | 无 | 支持条件写入的FS | 低(ms) | 高 | 低 |
-| BaseZookeeperBasedLockProvider | ZooKeeper | 任何 | 低(ms) | 高 | 中 |
+| ZookeeperBasedLockProvider | ZooKeeper | 任何 | 低(ms) | 高 | 中 |
+| ZookeeperBasedImplicitBasePathLockProvider | ZooKeeper | 任何 | 低(ms) | 高 | 中 |
 | HiveMetastoreBasedLockProvider | HMS + ZK | 任何 | 中(100ms+) | 高 | 中 |
-| DynamoDBBasedLockProviderBase | DynamoDB | AWS S3 | 中(10-100ms) | 高 | 低(Serverless) |
+| DynamoDBBasedLockProvider | DynamoDB | AWS S3 | 中(10-100ms) | 高 | 低(Serverless) |
+| DynamoDBBasedImplicitPartitionKeyLockProvider | DynamoDB | AWS S3 | 中(10-100ms) | 高 | 低(Serverless) |
 | NoopLockProvider | 无 | 任何 | 零 | 无保障 | 无 |
 
 ---
@@ -1266,7 +1276,7 @@ private Option<StoragePath> create(StoragePath markerPath, boolean checkIfExists
 
 早期冲突检测（Early Conflict Detection）的目标是：**在写入过程中就检测冲突，尽早失败，减少浪费。**
 
-#### 11.2 SimpleDirectMarkerBasedDetectionStrategy
+#### 11.2 SimpleTransactionDirectMarkerBasedDetectionStrategy
 
 **源码路径**：`hudi-client/hudi-client-common/src/main/java/org/apache/hudi/table/marker/SimpleTransactionDirectMarkerBasedDetectionStrategy.java`
 
@@ -2273,7 +2283,7 @@ hoodie.write.num.retries.on.conflict.failures=1
 **配置**：
 ```properties
 hoodie.write.concurrency.mode=OPTIMISTIC_CONCURRENCY_CONTROL
-hoodie.write.lock.provider=org.apache.hudi.client.transaction.lock.BaseZookeeperBasedLockProvider
+hoodie.write.lock.provider=org.apache.hudi.client.transaction.lock.ZookeeperBasedLockProvider
 hoodie.write.lock.zookeeper.url=zk-host:2181
 hoodie.write.lock.zookeeper.base_path=/hudi/locks
 hoodie.write.num.retries.on.conflict.failures=3

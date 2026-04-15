@@ -835,7 +835,7 @@ public abstract class HoodieWriterClientTestHarness extends HoodieCommonTestHarn
 
 ```java
 @Slf4j
-public class HoodieSparkClientTestHarness extends HoodieWriterClientTestHarness {
+public abstract class HoodieSparkClientTestHarness extends HoodieWriterClientTestHarness {
   // Spark 环境
   private static transient SparkSession spark;
   private static transient SQLContext sqlContext;
@@ -2036,7 +2036,7 @@ JIRA: https://issues.apache.org/jira/browse/HUDI-XXXX
 | **RFC-38** | Spark Datasource V2 Integration | `rfc/rfc-38/rfc-38.md` | Spark DataSource V2 API 集成 |
 | **RFC-40** | Hudi Connector for Trino | `rfc/rfc-40/rfc-40.md` | Trino 原生 Connector |
 | **RFC-51** | Hudi to support Change-Data-Capture | `rfc/rfc-51/rfc-51.md` | CDC 支持，可以读取增量变更流 |
-| **RFC-55** | Improve hudi-sync classes design | `rfc/rfc-55/rfc-55.md` | 改进同步模块的类设计和配置 |
+| **RFC-55** | Improve hudi-sync classes design and simplify configs | `rfc/rfc-55/rfc-55.md` | 改进同步模块的类设计和配置 |
 | **RFC-60** | Federated Storage Layout | `rfc/rfc-60/rfc-60.md` | 联邦存储布局，支持多存储系统 |
 
 ---
@@ -2366,7 +2366,7 @@ mvn clean package -DskipTests -Dcheckstyle.skip=true
 | Hadoop | 2.10.2 | 分布式存储 |
 | Hive | 2.3.10 | Metastore 集成 |
 | SLF4J | 1.7.36 | 日志门面 |
-| Log4j2 | 2.25.3 | 日志实现 |
+| Log4j2 | 2.25.4 | 日志实现 |
 | Jackson | 2.15.2 | JSON 处理 |
 | Lombok | 1.18.36 | 样板代码生成 |
 | Awaitility | 3.1.2 | 异步测试工具 |
@@ -2540,9 +2540,11 @@ hudi-client/hudi-client-common/src/main/java/org/apache/hudi/
 hudi-hadoop-common/src/test/java/org/apache/hudi/common/testutils/
 ├── HoodieCommonTestHarness.java           # 基础测试工具
 ├── HoodieTestTable.java                   # 模拟表构建器
-├── HoodieTestDataGenerator.java           # 测试数据生成
 └── minicluster/
     └── HdfsTestService.java               # 嵌入式 HDFS
+
+hudi-common/src/test/java/org/apache/hudi/common/testutils/
+└── HoodieTestDataGenerator.java           # 测试数据生成
 
 hudi-client/hudi-client-common/src/test/java/org/apache/hudi/utils/
 └── HoodieWriterClientTestHarness.java     # 写入测试基类

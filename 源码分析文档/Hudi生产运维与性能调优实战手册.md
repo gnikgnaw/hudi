@@ -436,7 +436,7 @@ hoodie.metrics.reporter.type=PROMETHEUS_PUSHGATEWAY
 hoodie.write.concurrency.mode=optimistic_concurrency_control
 
 # 配置分布式锁（必须）
-hoodie.write.lock.provider=org.apache.hudi.client.transaction.lock.BaseZookeeperBasedLockProvider
+hoodie.write.lock.provider=org.apache.hudi.client.transaction.lock.ZookeeperBasedLockProvider
 hoodie.write.lock.zookeeper.url=zk-host:2181
 hoodie.write.lock.zookeeper.lock_key=my_table_lock
 

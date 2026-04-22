@@ -976,6 +976,15 @@ public class FileSliceHandler extends Handler {
             .collect(Collectors.toList());
     }
 
+    // 获取 pending log compaction 操作
+    public List<CompactionOpDTO> getPendingLogCompactionOperations(String basePath) {
+        return viewManager.getFileSystemView(basePath)
+            .getPendingLogCompactionOperations()
+            .map(instantOp -> CompactionOpDTO.fromCompactionOperation(
+                instantOp.getKey(), instantOp.getValue()))
+            .collect(Collectors.toList());
+    }
+
     // 获取 pending clustering 的文件组
     public List<ClusteringOpDTO> getFileGroupsInPendingClustering(String basePath) {
         return viewManager.getFileSystemView(basePath)

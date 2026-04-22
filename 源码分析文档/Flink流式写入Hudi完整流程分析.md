@@ -209,34 +209,54 @@ public class HoodieTableSink implements
       OptionsInference.setupSinkTasks(conf, 
           dataStream.getExecutionConfig().getParallelism());
       
-      // 3. 初始化表
+      // 3. 设置 Client ID（多 Writer 场景）
+      OptionsInference.setupClientId(conf);
+      
+      // 4. 设置运行时配置
+      OptionsInference.setupRuntimeConfigs(conf, 
+          dataStream.getExecutionEnvironment().getConfiguration());
+      
+      // 5. 初始化表
       StreamerUtil.initTableFromClientIfNecessary(conf);
+      
+      // 6. 设置索引相关配置
+      OptionsInference.setupIndexConfigs(conf);
       
       RowType rowType = (RowType) schema.toSinkRowDataType()
           .notNull().getLogicalType();
 
-      // 4. 根据操作类型构建 Pipeline
+      // 7. 根据操作类型构建 Pipeline
       if (OptionsResolver.isBulkInsertOperation(conf)) {
         return Pipelines.dummySink(Pipelines.bulkInsert(conf, rowType, dataStream));
       }
 
       if (OptionsResolver.isAppendMode(conf)) {
+        // 关闭 Compaction（Append 模式不需要）
+        conf.set(FlinkOptions.COMPACTION_SCHEDULE_ENABLED, false);
         DataStream<RowData> pipeline = Pipelines.append(conf, rowType, dataStream);
         if (OptionsResolver.needsAsyncClustering(conf)) {
           return Pipelines.cluster(conf, rowType, pipeline);
+        } else if (OptionsResolver.isLazyFailedWritesCleanPolicy(conf)) {
+          // 添加 Clean 函数以回滚失败的写入
+          return Pipelines.clean(conf, pipeline);
         } else {
           return Pipelines.dummySink(pipeline);
         }
       }
 
-      // 5. 标准 Upsert 流程
+      // 8. 标准 Upsert 流程
       final DataStream<HoodieFlinkInternalRow> hoodieRecordDataStream = 
           Pipelines.bootstrap(conf, rowType, dataStream, context.isBounded(), overwrite);
       DataStream<RowData> pipeline = 
           Pipelines.hoodieStreamWrite(conf, rowType, hoodieRecordDataStream);
       
-      // 6. Compaction
-      if (OptionsResolver.needsAsyncCompaction(conf)) {
+      // 9. Compaction 或 Metadata Compaction
+      if (OptionsResolver.needsAsyncCompaction(conf) 
+          || OptionsResolver.needsAsyncMetadataCompaction(conf)) {
+        // 批处理模式使用同步 Compaction
+        if (context.isBounded()) {
+          conf.set(FlinkOptions.COMPACTION_OPERATION_EXECUTE_ASYNC_ENABLED, false);
+        }
         return Pipelines.compact(conf, pipeline);
       } else {
         return Pipelines.clean(conf, pipeline);
@@ -358,6 +378,7 @@ public class StreamWriteFunction extends AbstractStreamWriteFunction<HoodieFlink
     }
     final WriteMetadataEvent event = WriteMetadataEvent.builder()
         .taskID(taskID)
+        .checkpointId(checkpointId)
         .instantTime(currentInstant)
         .writeStatus(writeStatus)
         .lastBatch(true)
@@ -367,7 +388,10 @@ public class StreamWriteFunction extends AbstractStreamWriteFunction<HoodieFlink
     this.eventGateway.sendEventToCoordinator(event);
     this.buckets.clear();
     this.tracer.reset();
+    this.writeClient.cleanHandles();
+    this.writeStatuses.addAll(writeStatus);
     writeMetrics.endDataFlush();
+    writeMetrics.resetAfterCommit();
   }
 
   @Override
@@ -457,12 +481,15 @@ public class StreamWriteOperatorCoordinator
       // 流式模式下，提交所有已接收的事件
       // 流式写入任务同步快照和刷新数据缓冲区
       // 因此成功的 checkpoint 会包含旧的 checkpoint（遵循 checkpoint 包含契约）
-      EventBuffer eventBuffer = eventBuffers.getEventBuffer(checkpointId);
-      if (eventBuffer != null) {
-        String instant = eventBuffer.getInstant();
-        doCommit(checkpointId, instant, eventBuffer.getDataWriteResults(), eventBuffer.getIndexWriteResults());
+      final boolean committed = commitInstants(checkpointId);
+      // 调度 Compaction 或 Clustering（如果启用）
+      scheduleTableServices(committed);
+      
+      if (committed) {
+        // 异步同步 Hive 元数据
+        syncHiveAsync();
       }
-    });
+    }, "commits the instant %s", this.instant);
   }
 
   @Override
@@ -1175,21 +1202,21 @@ write.task.max.size=1024
 #   - 数据量小：保持 4-8
 write.tasks=8
 
-# Bootstrap 任务数（默认 4）
+# Bootstrap 任务数（默认与写入任务数相同）
 # 含义：并行加载索引的 Task 数量
 # 调优建议：
-#   - 一般设置为写入任务数的 1/2
-#   - 索引大：增加任务数
-#   - 索引小：减少任务数
-index.bootstrap.tasks=4
+#   - 默认与写入任务数相同，无需单独配置
+#   - 索引大：可以增加任务数
+#   - 索引小：可以减少任务数
+# index.bootstrap.tasks=8  # 可选配置，不设置则使用默认值
 
-# Compaction 并行度（默认 4）
+# Compaction 并行度（默认与写入任务数相同）
 # 含义：并行执行 Compaction 的 Task 数量
 # 调优建议：
-#   - 一般设置为写入任务数的 1/2
-#   - 文件多：增加任务数
-#   - 文件少：减少任务数
-compaction.tasks=4
+#   - 默认与写入任务数相同，无需单独配置
+#   - 文件多：可以增加任务数
+#   - 文件少：可以减少任务数
+# compaction.tasks=8  # 可选配置，不设置则使用默认值
 ```
 
 **调优示例**：
@@ -1266,9 +1293,9 @@ compaction.trigger.strategy=num_commits
 #   - 写多读少：增加值，优化写入性能
 compaction.delta_commits=5
 
-# Compaction 并行度（默认 4）
+# Compaction 并行度（默认与写入任务数相同）
 # 含义：并行执行 Compaction 的 Task 数量
-compaction.tasks=4
+# compaction.tasks=8  # 可选配置，不设置则使用默认值
 ```
 
 **调优示例**：
@@ -1341,9 +1368,9 @@ index.type=FLINK_STATE
 #   - CONSISTENT_HASHING：一致性哈希（支持动态扩展）
 hoodie.index.bucket.engine=CONSISTENT_HASHING
 
-# 索引并行度（默认 4）
+# 索引并行度（默认与写入任务数相同）
 # 含义：并行构建索引的 Task 数量
-index.bootstrap.tasks=4
+# index.bootstrap.tasks=8  # 可选配置，不设置则使用默认值
 ```
 
 **调优示例**：
@@ -1585,8 +1612,8 @@ Bulk Insert 模式：
 
 计算方法：
   - 写入任务数 = CPU 核数 × 1-2
-  - Bootstrap 任务数 = 写入任务数 ÷ 2
-  - Compaction 任务数 = 写入任务数 ÷ 2
+  - Bootstrap 任务数 = 默认与写入任务数相同（可根据需要调整）
+  - Compaction 任务数 = 默认与写入任务数相同（可根据需要调整）
 
 调整方向：
   - 吞吐低：增加并行度
@@ -1609,7 +1636,7 @@ Bulk Insert 模式：
 
 配置建议：
   - 频率：每 5-10 个 Commit 后触发
-  - 并行度：写入任务数的 1/2
+  - 并行度：默认与写入任务数相同（可根据需要调整）
   - 时间：非高峰期执行
 ```
 

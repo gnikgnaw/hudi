@@ -834,7 +834,13 @@ public Option<IndexedRecord> getInsertValue(Schema schema) throws IOException {
 ```java
 static String getAvroPayloadForMergeMode(RecordMergeMode mergeMode, String payloadClassName) {
   switch (mergeMode) {
-    case EVENT_TIME_ORDERING: return DefaultHoodieRecordPayload.class.getName();
+    case EVENT_TIME_ORDERING:
+      // 如果用户显式指定了 EventTimeAvroPayload,则使用它;否则使用 DefaultHoodieRecordPayload
+      if (!StringUtils.isNullOrEmpty(payloadClassName)
+          && payloadClassName.contains(EventTimeAvroPayload.class.getName())) {
+        return EventTimeAvroPayload.class.getName();
+      }
+      return DefaultHoodieRecordPayload.class.getName();
     case COMMIT_TIME_ORDERING: return OverwriteWithLatestAvroPayload.class.getName();
     case CUSTOM: return payloadClassName;
   }

@@ -200,7 +200,7 @@ public static void runHoodieMetaSync(String syncToolClassName, TypedProperties p
 
 **关键设计细节**：
 
-1. **基于表粒度的锁机制**：使用 `ConcurrentHashMap<String, Lock>` 按 basePath 维护锁。同一个表的并发同步请求会被串行化，避免 Hive Metastore 的 `ConcurrentModificationException`。
+1. **基于表粒度的锁机制**：使用 `ConcurrentHashMap<String, Lock>` 按 basePath 维护锁。同一个表的并发同步请求会被串行化，避免 Hive Metastore 的并发修改异常。
 2. **反射实例化**：通过 `syncToolClassName` 动态加载同步工具类，支持多种构造函数签名的向后兼容。
 3. **try-with-resources**：确保同步完成后释放所有资源。
 
@@ -227,7 +227,7 @@ public static void runHoodieMetaSync(String syncToolClassName, TypedProperties p
 | `hoodie.meta.sync.touch.partitions.enabled` | false | 是否产生 TOUCH 事件 |
 | `hoodie.meta.sync.no_partition_metadata` | false | 是否跳过分区元数据同步 |
 
-**配置推断机制**：许多配置项都带有 `withInferFunction`，可以从 `HoodieTableConfig` 中自动推断。例如 `META_SYNC_DATABASE_NAME` 可以从 `DATABASE_NAME` 推断，`META_SYNC_TABLE_NAME` 可以从 `HOODIE_TABLE_NAME_KEY` 推断。这减少了用户需要显式配置的参数数量。
+**配置推断机制**：许多配置项都带有推断功能，可以从 `HoodieTableConfig` 中自动推断。例如 `META_SYNC_DATABASE_NAME` 可以从 `DATABASE_NAME` 推断，`META_SYNC_TABLE_NAME` 可以从表名推断。这减少了用户需要显式配置的参数数量。
 
 ---
 
@@ -485,7 +485,7 @@ private boolean detectThriftIncompatibility(Exception e) {
 }
 ```
 
-这种 **渐进式降级** 的设计非常巧妙：正常情况下使用高效的 Thrift 客户端，只有在实际遇到不兼容时才降级到 JDBC，避免了预防性的性能牺牲。
+这种渐进式降级的设计非常巧妙：正常情况下使用高效的 Thrift 客户端，只有在实际遇到不兼容时才降级到 JDBC，避免了预防性的性能牺牲。
 
 ---
 
@@ -534,7 +534,7 @@ override def createTable(ident: Identifier, schema: StructType,
 
 `createHoodieTable()` 的核心逻辑：
 
-1. **解析分区和 Bucket 信息**：通过 `convertTransforms()` 方法将 Spark 的 `Transform` 数组转换为分区列名和可选的 `BucketSpec`
+1. **解析分区和 Bucket 信息**：将 Spark 的 `Transform` 数组转换为分区列名和可选的 `BucketSpec`
 2. **构造 `CatalogTable` 描述**：设置 provider 为 "hudi"，配置 storage format
 3. **创建 `HoodieCatalogTable`**：Hudi 的内部表描述，包含 Hudi 特有的配置
 4. **初始化 Hudi 表**：在指定路径上创建 `.hoodie` 元数据目录

@@ -1,9 +1,9 @@
 # Hudi 索引机制深度解析
 
 > 基于 Apache Hudi 源码深度分析（已纠错 + 扩展）
-> 文档版本：4.1
-> 源码版本：v1.2.0-SNAPSHOT (master)
-> 最后更新：2026-04-21
+> 文档版本：4.2
+> 源码版本：v1.2.0-SNAPSHOT (master, commit 348b4e99b3a2)
+> 最后更新：2026-04-22
 
 ---
 
@@ -516,9 +516,10 @@ isGlobal() = false
 
 ```
 继承关系:
-SparkMetadataTableRecordLevelIndex
-    extends SparkMetadataTableGlobalRecordLevelIndex
-        extends HoodieIndex
+SparkMetadataTableGlobalRecordLevelIndex extends HoodieIndex
+SparkMetadataTableRecordLevelIndex extends HoodieIndex
+
+两者是平行关系，都直接继承 HoodieIndex，而非嵌套继承。
 
 关键实现:
 1. 将待查找的 Record Key 按 Metadata Table 的 file group shard 进行分区
@@ -1104,7 +1105,7 @@ HoodieWriteConfig otherConfig = HoodieWriteConfig.newBuilder()
 
 ---
 
-**文档版本**: 4.1（源码验证通过 + 细节修正）
+**文档版本**: 4.2（源码验证通过 + 继承关系修正）
 **创建日期**: 2026-04-14
-**最后更新**: 2026-04-21
-**基于 Hudi 版本**: v1.2.0-SNAPSHOT (master)
+**最后更新**: 2026-04-22
+**基于 Hudi 版本**: v1.2.0-SNAPSHOT (master, commit 348b4e99b3a2)

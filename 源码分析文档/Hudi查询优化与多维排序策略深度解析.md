@@ -1,9 +1,9 @@
 # Hudi 查询优化与多维排序策略深度解析
 
 > 基于 Apache Hudi 源码深度分析
-> 文档版本：1.1
-> 源码版本：v1.2.0-SNAPSHOT (master)
-> 最后更新：2026-04-21
+> 文档版本：1.2
+> 源码版本：v1.2.0-SNAPSHOT (commit: 348b4e99b3a2)
+> 最后更新：2026-04-22
 
 ---
 
@@ -374,7 +374,7 @@ Hilbert 路径 (2D):
 
 **源码实现**：使用 `org.davidmoten.hilbert.HilbertCurve` 库
 
-**源码位置**：`hudi-common/src/main/java/org/apache/hudi/optimize/HilbertCurveUtils.java`
+**源码位置**：`hudi-client/hudi-client-common/src/main/java/org/apache/hudi/optimize/HilbertCurveUtils.java`
 
 ```java
 public static byte[] indexBytes(HilbertCurve hilbertCurve, long[] points, int paddingNum) {
@@ -796,7 +796,7 @@ private static long mapColumnValueToLong(Row row, int index, DataType dataType) 
 | Int | `intTo8Byte`: XOR 符号位 + 补零到 8 字节 | 直接强转 long | 补零保证所有类型长度统一 |
 | String | `utf8To8Byte`: 取 UTF-8 前 8 字节 | 前 8 字节转 long | 字符串截断是有损映射，但保留了前缀排序性 |
 | Date/Timestamp | 取 `getTime()` 毫秒值后同 Long 处理 | 取 `getTime()` 毫秒值 | 时间类型天然是有序数值 |
-| Boolean | true=1, false=0 后同 Int 处理 | true=MAX_VALUE, false=0 | 二值类型不适合空间曲线排序，但为了兼容性支持 |
+| Boolean | true=1, false=0 后同 Int 处理 | true=Long.MAX_VALUE, false=0 | 二值类型不适合空间曲线排序，但为了兼容性支持 |
 | Decimal | `longValue()` 取整后同 Long 处理 | `longValue()` 取整 | 有精度损失，大 Decimal 可能溢出 |
 
 **为什么 `longTo8Byte` 要 XOR 符号位？**
@@ -1525,21 +1525,23 @@ override def sizeInBytes: Long = {
 
 ## 审查记录
 
-**审查日期**: 2026-04-21
+**审查日期**: 2026-04-22
 **审查内容**: 
 1. 验证了所有类名、方法名和源码位置的准确性
 2. 确认了配置项名称的正确性
-3. 补充了源码行号和完整方法签名
-4. 修正了类型定义（ColumnStatsIndexSupport 是 class 而非 trait）
+3. 验证了源码行号和完整方法签名
+4. 修正了类型定义和路径错误
 
 **主要修正**:
-- 补充了 `LayoutOptimizationStrategy` 枚举的完整注解
-- 更新了 `orderDataFrameByMappingValues` 方法的完整签名
-- 补充了 `createZCurveSortedRDD` 和 `createHilbertSortedRDD` 的完整实现
-- 添加了 `HilbertCurveUtils` 的源码位置
-- 明确了 `ColumnStatsIndexSupport` 的类型定义
+- 修正了 `HilbertCurveUtils` 的源码路径：从 `hudi-common` 更正为 `hudi-client/hudi-client-common`
+- 更正了 Boolean 类型在 `mapColumnValueToLong` 中的映射描述：从 `true=MAX_VALUE` 更正为 `true=Long.MAX_VALUE`
+- 验证了所有方法的行号准确性（orderDataFrameByMappingValues 第84行，createZCurveSortedRDD 第150行，createHilbertSortedRDD 第168行等）
+- 确认了 `ColumnStatsIndexSupport` 是 class 而非 trait
+- 验证了 `indicesSupport` 的索引顺序与源码一致
+- 确认了所有配置项名称的准确性
 
-**文档版本**: 1.1
+**文档版本**: 1.2
 **创建日期**: 2026-04-15
-**最后审查**: 2026-04-21
-**基于 Hudi 版本**: v1.2.0-SNAPSHOT (master)
+**最后审查**: 2026-04-22
+**基于 Hudi 版本**: v1.2.0-SNAPSHOT (commit: 348b4e99b3a2)
+**审查基准**: commit 348b4e99b3a2

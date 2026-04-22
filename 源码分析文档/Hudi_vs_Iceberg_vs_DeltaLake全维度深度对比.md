@@ -2,7 +2,7 @@
 
 > 基于 Apache Hudi v1.2.0-SNAPSHOT 源码视角，全面解析三大数据湖表格式的架构差异与技术选型
 >
-> 撰写日期：2026-04-15
+> 撰写日期：2026-04-15 | 最后审查：2026-04-22
 >
 > **免责声明**：本文档从 Hudi 源码专家视角撰写，力求客观公正，但不可避免地对 Hudi 的技术细节有更深入的了解。文中对 Iceberg 和 Delta Lake 的描述基于公开文档和社区资料。建议读者结合各项目的官方文档和实际测试结果做出选型决策。
 
@@ -298,8 +298,8 @@ public enum IndexType {
     BUCKET,                     // 桶索引，O(1) 查找
     FLINK_STATE,                // Flink 状态后端（内部配置）
     @Deprecated
-    RECORD_INDEX,               // 已废弃，请使用 GLOBAL_RECORD_LEVEL_INDEX（全局唯一）
-                                // 或 RECORD_LEVEL_INDEX（分区内唯一）
+    RECORD_INDEX,               // 已废弃，请使用 GLOBAL_RECORD_LEVEL_INDEX（全局唯一键）
+                                // 或 RECORD_LEVEL_INDEX（分区内唯一键）
     GLOBAL_RECORD_LEVEL_INDEX,  // 全局记录级索引（全表唯一键）
     RECORD_LEVEL_INDEX          // 分区级记录级索引（分区内唯一键）
 }

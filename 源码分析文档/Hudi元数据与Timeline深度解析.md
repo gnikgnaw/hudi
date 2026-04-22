@@ -608,7 +608,7 @@ public class HoodieWriteStat extends HoodieReadStats {
 - 用户自定义的 checkpoint 信息（如 DeltaStreamer 的 Kafka offset）
 - 任何通过 `HoodieWriteConfig.EXTRA_METADATA_PREFIX` 传入的自定义元数据
 
-**operationType** 是一个枚举，覆盖了 Hudi 支持的所有写入操作类型：`INSERT`、`UPSERT`、`BULK_INSERT`、`DELETE`、`INSERT_OVERWRITE`、`DELETE_PARTITION`、`INSERT_OVERWRITE_TABLE`、`CLUSTER`、`COMPACT`、`LOG_COMPACT`、`ALTER_SCHEMA`、`INDEX`、`BUCKET_RESCALE` 等共 17 种。
+**operationType** 是一个枚举，覆盖了 Hudi 支持的所有写入操作类型：`INSERT`、`INSERT_PREPPED`、`UPSERT`、`UPSERT_PREPPED`、`BULK_INSERT`、`BULK_INSERT_PREPPED`、`DELETE`、`DELETE_PREPPED`、`BOOTSTRAP`、`INSERT_OVERWRITE`、`BUCKET_RESCALE`、`CLUSTER`、`DELETE_PARTITION`、`INSERT_OVERWRITE_TABLE`、`COMPACT`、`INDEX`、`ALTER_SCHEMA`、`LOG_COMPACT`、`UNKNOWN` 等共 19 种。
 
 **HoodieReplaceCommitMetadata** 继承自 `HoodieCommitMetadata`，额外增加了一个关键字段：
 

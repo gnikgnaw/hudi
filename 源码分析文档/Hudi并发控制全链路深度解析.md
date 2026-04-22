@@ -29,7 +29,7 @@
   - [15. PreferWriterConflictResolutionStrategy](#15-preferwriterconflictresolutionstrategy)
   - [16. ConcurrentOperation](#16-concurrentoperation)
 - [第六部分：冲突重试机制](#第六部分冲突重试机制)
-  - [17. HoodieSparkSqlWriterInternal 的重试循环](#17-hoodieparksqlwriterinternal-的重试循环)
+  - [17. HoodieSparkSqlWriterInternal 的重试循环](#17-hoodiesparkqlwriterinternal-的重试循环)
   - [18. NUM_RETRIES_ON_CONFLICT_FAILURES 配置](#18-num_retries_on_conflict_failures-配置)
 - [第七部分：端到端并发场景分析](#第七部分端到端并发场景分析)
   - [19. 场景 1: 两个 Spark 作业同时 upsert](#19-场景-1-两个-spark-作业同时-upsert)

@@ -693,7 +693,7 @@ public void monitorDirAndForwardSplits(SourceContext<MergeOnReadInputSplit> cont
 
     // 获取新的分片（如果有剩余分片则使用剩余的，否则发现新的）
     IncrementalInputSplits.Result result = remainingSplits.isEmpty()
-        ? incrementalInputSplits.inputSplits(metaClient, this.cdcEnabled)
+        ? incrementalInputSplits.inputSplits(metaClient, this.issuedOffset, this.cdcEnabled)
         : IncrementalInputSplits.Result.instance(remainingSplits, issuedInstant, issuedOffset);
 
     List<MergeOnReadInputSplit> inputSplits = result.getInputSplits();
@@ -713,7 +713,11 @@ public void monitorDirAndForwardSplits(SourceContext<MergeOnReadInputSplit> cont
 }
 ```
 
-**注意**：`IncrementalInputSplits.inputSplits()` 方法签名中不包含 `issuedOffset` 参数，而是通过配置 `FlinkOptions.READ_START_COMMIT` 来控制起始位置。`StreamReadMonitoringFunction` 在每次调用前会动态更新这个配置值。
+**注意**：`IncrementalInputSplits` 提供了两个 `inputSplits()` 重载方法：
+- `inputSplits(HoodieTableMetaClient, boolean)` - 通过配置 `FlinkOptions.READ_START_COMMIT` 控制起始位置
+- `inputSplits(HoodieTableMetaClient, String issuedOffset, boolean)` - 直接传入 `issuedOffset` 参数
+
+`StreamReadMonitoringFunction` 使用第二个重载版本（见源码第253行），直接传入 `issuedOffset` 来控制增量读取的起始位置。
 ```
 
 **`splitsLimit` 限流设计的好处：**
@@ -753,7 +757,10 @@ public class HoodieContinuousSplitEnumerator extends AbstractHoodieSplitEnumerat
             // 如果待处理的分片太多，暂停发现
             return HoodieContinuousSplitBatch.EMPTY;
         }
-        return splitDiscover.discoverSplits(position.get().getIssuedOffset()...);
+        return splitDiscover.discoverSplits(
+            position.get().getIssuedOffset().isPresent() 
+                ? position.get().getIssuedOffset().get() 
+                : null);
     }
 }
 ```

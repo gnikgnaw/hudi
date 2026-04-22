@@ -128,8 +128,8 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `write.batch.size` | 256（MB） | 64-2048 | 批缓冲区大小（MB），越大吞吐越高但延迟越高，见 `FlinkOptions.java:791` |
-| `write.task.max.size` | 1024（MB） | 512-8192 | 单个写入任务最大内存（MB），超过阈值刷出最大 bucket，防止 OOM，见 `FlinkOptions.java:714` |
+| `write.batch.size` | 256（MB） | 64-2048 | 批缓冲区大小（MB），控制数据刷盘阈值，越大吞吐越高但延迟越高、内存占用越多，见 `FlinkOptions.java:791` |
+| `write.task.max.size` | 1024（MB） | 512-8192 | 单个写入任务最大内存（MB），超过阈值会刷出最大的 bucket 以防止 OOM，见 `FlinkOptions.java:714` |
 
 **调优建议**：
 - 内存充足（16GB+）：`write.batch.size=1024`, `write.task.max.size=4096`
@@ -142,15 +142,16 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `write.tasks` | 无（取执行环境并行度） | 1-64 | 写入任务数，越多吞吐越高但资源占用越多，见 `FlinkOptions.java:707` |
-| `write.index_bootstrap.tasks` | 无（同 write.tasks） | 1-32 | Bootstrap 任务数，一般为写入任务数的 1/2，见 `FlinkOptions.java:693` |
-| `compaction.tasks` | 无（同 write.tasks） | 1-32 | Compaction 任务数，一般为写入任务数的 1/2，见 `FlinkOptions.java:929` |
-| `index.write.tasks` | 无（同 write.tasks） | 1-32 | Index Bootstrap 阶段 index write 子任务并行度，见 `FlinkOptions.java:331` |
+| `write.tasks` | 无（取执行环境并行度） | 1-64 | 写入算子并行度，决定写入任务数量，越多吞吐越高但资源占用越多，见 `FlinkOptions.java:707` |
+| `write.index_bootstrap.tasks` | 无（同 write.tasks） | 1-32 | Index Bootstrap 阶段的并行度，一般设为写入并行度的 1/2，见 `FlinkOptions.java:693` |
+| `compaction.tasks` | 无（同 write.tasks） | 1-32 | Compaction 算子并行度，一般设为写入并行度的 1/2，见 `FlinkOptions.java:929` |
+| `index.write.tasks` | 无（同 write.tasks） | 1-32 | Index Bootstrap 阶段 index write 子任务并行度（仅 Record Level Index 使用），见 `FlinkOptions.java:331` |
 
 **调优建议**：
-- 高吞吐：`write.tasks=CPU核数×2`, `bootstrap.tasks=CPU核数`, `compaction.tasks=CPU核数`
-- 低资源：`write.tasks=4`, `bootstrap.tasks=2`, `compaction.tasks=2`
-- 平衡：`write.tasks=CPU核数`, `bootstrap.tasks=CPU核数/2`, `compaction.tasks=CPU核数/2`
+- 高吞吐：`write.tasks=CPU核数×2`, `index_bootstrap.tasks=CPU核数`, `compaction.tasks=CPU核数`
+- 低资源：`write.tasks=4`, `index_bootstrap.tasks=2`, `compaction.tasks=2`
+- 平衡：`write.tasks=CPU核数`, `index_bootstrap.tasks=CPU核数/2`, `compaction.tasks=CPU核数/2`
+- 注意：所有并行度参数默认继承 Flink 执行环境的并行度，建议根据数据量和资源显式设置
 
 ---
 
@@ -159,15 +160,16 @@ compaction.delta_commits=20
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `compaction.async.enabled` | true | 是否启用异步 Compaction（MOR 表默认开启），见 `FlinkOptions.java:922` |
-| `compaction.trigger.strategy` | num_commits | Compaction 触发策略，取值：`num_commits` / `num_commits_after_last_request` / `time_elapsed` / `num_and_time` / `num_or_time`，见 `FlinkOptions.java:947` |
-| `compaction.delta_commits` | 5 | 多少个 delta commit 后触发 Compaction，见 `FlinkOptions.java:959` |
-| `compaction.delta_seconds` | 3600 | 多少秒后触发 Compaction（默认 1 小时），见 `FlinkOptions.java:966` |
+| `compaction.trigger.strategy` | num_commits | Compaction 触发策略，见 `FlinkOptions.java:947`<br/>可选值：<br/>• `num_commits` - 达到指定 delta commit 数量后触发<br/>• `num_commits_after_last_request` - 自上次请求/完成 compaction 后达到指定 delta commit 数量触发<br/>• `time_elapsed` - 自上次 compaction 后经过指定时间触发<br/>• `num_and_time` - 同时满足 commit 数量和时间条件<br/>• `num_or_time` - 满足 commit 数量或时间条件之一 |
+| `compaction.delta_commits` | 5 | 触发 Compaction 所需的 delta commit 数量（配合 num_commits 相关策略使用），见 `FlinkOptions.java:959` |
+| `compaction.delta_seconds` | 3600 | 触发 Compaction 所需的时间间隔（秒，配合 time_elapsed 相关策略使用），默认 1 小时，见 `FlinkOptions.java:966` |
 
 **调优建议**：
-- 生产环境：默认已启用 `compaction.async.enabled=true`
-- 读多写少：`compaction.delta_commits=5`（频繁 Compaction）
-- 写多读少：`compaction.delta_commits=20`（减少 Compaction）
-- 实时性要求高：`compaction.trigger.strategy=time_elapsed`, `compaction.delta_seconds=300`
+- 生产环境：默认已启用 `compaction.async.enabled=true`，无需额外配置
+- 读多写少场景：`compaction.delta_commits=5`（频繁 Compaction，减少读放大）
+- 写多读少场景：`compaction.delta_commits=20`（减少 Compaction 频率，提升写入吞吐）
+- 实时性要求高：`compaction.trigger.strategy=time_elapsed`, `compaction.delta_seconds=300`（5分钟触发一次）
+- 平衡场景：`compaction.trigger.strategy=num_or_time`, `compaction.delta_commits=10`, `compaction.delta_seconds=1800`（10个commit或30分钟，满足其一即触发）
 
 ---
 
@@ -175,23 +177,27 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `index.type` | FLINK_STATE | 索引类型：FLINK_STATE（默认）/ BUCKET / BLOOM / GLOBAL_BLOOM / SIMPLE / GLOBAL_SIMPLE / RECORD_LEVEL_INDEX / GLOBAL_RECORD_LEVEL_INDEX / INMEMORY，见 `FlinkOptions.java:257`，枚举定义 `HoodieIndex.java:161` |
-| `hoodie.index.bucket.engine` | SIMPLE | 桶引擎：SIMPLE / CONSISTENT_HASHING，见 `FlinkOptions.java:598`（Flink 端 key 与 `HoodieIndexConfig.BUCKET_INDEX_ENGINE_TYPE` 对齐） |
+| `index.type` | FLINK_STATE | 索引类型：FLINK_STATE（默认，Flink 状态后端索引）/ BUCKET（桶索引，高性能）/ BLOOM（布隆过滤器，分区内唯一）/ GLOBAL_BLOOM（全局布隆过滤器）/ SIMPLE（简单索引，分区内唯一）/ GLOBAL_SIMPLE（全局简单索引）/ RECORD_LEVEL_INDEX（记录级索引，分区内唯一）/ GLOBAL_RECORD_LEVEL_INDEX（全局记录级索引）/ INMEMORY（内存索引）/ RECORD_INDEX（已废弃，使用 GLOBAL_RECORD_LEVEL_INDEX 替代），见 `FlinkOptions.java:257`，枚举定义 `HoodieIndex.java:161` |
+| `hoodie.index.bucket.engine` | SIMPLE | 桶索引引擎类型（仅当 index.type=BUCKET 时生效）：SIMPLE（简单哈希分桶）/ CONSISTENT_HASHING（一致性哈希，支持动态扩缩容），见 `FlinkOptions.java:598`，对应 `HoodieIndexConfig.BUCKET_INDEX_ENGINE_TYPE`（key: `hoodie.index.bucket.engine`） |
 
 **调优建议**：
-- 高并发 Upsert：`index.type=BUCKET`
-- 大表全局唯一场景：`index.type=RECORD_LEVEL_INDEX`
-- 默认场景：`index.type=FLINK_STATE`（利用 Flink 状态后端）
+- 高并发 Upsert + 固定分区数：`index.type=BUCKET`, `hoodie.index.bucket.engine=SIMPLE`
+- 高并发 Upsert + 动态扩缩容：`index.type=BUCKET`, `hoodie.index.bucket.engine=CONSISTENT_HASHING`
+- 大表全局唯一键场景：`index.type=GLOBAL_RECORD_LEVEL_INDEX`（需启用元数据表）
+- 大表分区内唯一键场景：`index.type=RECORD_LEVEL_INDEX`（需启用元数据表）
+- 默认场景：`index.type=FLINK_STATE`（利用 Flink 状态后端，无需额外配置）
 
 ---
 
 ### Checkpoint 参数
 
+**注意**：以下参数为 Flink 框架级配置，非 Hudi 特有参数，通过 Flink 配置文件或代码设置。
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `execution.checkpointing.interval` | 60000ms | Checkpoint 间隔 |
-| `execution.checkpointing.timeout` | 600000ms | Checkpoint 超时 |
-| `execution.checkpointing.mode` | EXACTLY_ONCE | Checkpoint 模式 |
+| `execution.checkpointing.interval` | 无默认值 | Checkpoint 间隔（毫秒），控制 Hudi 数据提交频率，建议 30000-120000ms |
+| `execution.checkpointing.timeout` | 600000ms | Checkpoint 超时时间（毫秒），超时会导致作业失败 |
+| `execution.checkpointing.mode` | EXACTLY_ONCE | Checkpoint 模式：EXACTLY_ONCE（精确一次）/ AT_LEAST_ONCE（至少一次） |
 
 **调优建议**：
 - 高吞吐：`interval=120000`, `timeout=1200000`

@@ -251,9 +251,24 @@ public Type refreshNewId(Type type, AtomicInteger nextId) {
             // 再递归处理每个字段的子类型
             for (int i = 0; i < oldFields.size(); i++) {
                 Type fieldType = refreshNewId(oldField.type(), nextId);
-                internalFields.add(Types.Field.get(currentId++, ...));
+                internalFields.add(Types.Field.get(currentId++, oldField.isOptional(), 
+                    oldField.name(), fieldType, oldField.doc()));
             }
-            ...
+            return Types.RecordType.get(internalFields);
+        case ARRAY:
+            int elementId = nextId.get();
+            nextId.set(elementId + 1);
+            Type elementType = refreshNewId(array.elementType(), nextId);
+            return Types.ArrayType.get(elementId, array.isElementOptional(), elementType);
+        case MAP:
+            int keyId = nextId.get();
+            int valueId = keyId + 1;
+            nextId.set(keyId + 2);
+            Type keyType = refreshNewId(map.keyType(), nextId);
+            Type valueType = refreshNewId(map.valueType(), nextId);
+            return Types.MapType.get(keyId, valueId, keyType, valueType, map.isValueOptional());
+        default:
+            return type;
     }
 }
 ```
@@ -380,11 +395,18 @@ public boolean isWiderThan(PrimitiveType other) {
         DecimalBase dt = (DecimalBase) other;
         return (precision - scale) >= (dt.precision - dt.scale) && scale > dt.scale;
     }
-    // ...
+    if (other instanceof IntType) {
+        return (precision - scale) >= 10 && scale > 0;
+    }
+    return false;
 }
 ```
 
-Decimal 的 `isWiderThan` 判断需要同时满足：整数位不减少 AND 小数位严格增大（`scale > dt.scale`）。在 `SchemaChangeUtils` 中，`isDecimalUpdateAllowInternalBase` 还额外允许 `precision >= src.precision && scale == src.scale` 的情况。此外，`DecimalTypeFixed` 还检查固定字节长度不能缩小。
+Decimal 的 `isWiderThan` 判断需要同时满足：
+- 对于 DecimalBase：整数位不减少 `(precision - scale) >= (dt.precision - dt.scale)` AND 小数位严格增大 `scale > dt.scale`
+- 对于 IntType：整数位至少 10 位 AND 小数位大于 0
+
+在 `SchemaChangeUtils.isDecimalUpdateAllowInternalBase` 中，除了使用 `isWiderThan` 判断外，还额外允许 `precision >= src.precision && scale == src.scale` 的情况（即只扩大 precision 而 scale 不变）。此外，`DecimalTypeFixed` 还检查固定字节长度不能缩小。
 
 ---
 
@@ -1000,7 +1022,9 @@ public static final ConfigProperty<Boolean> RECONCILE_SCHEMA = ConfigProperty
         + "schema as well as existing table's one. When schema reconciliation is DISABLED, incoming batch's "
         + "schema will be picked as a writer-schema (therefore updating table's schema). When schema reconciliation "
         + "is ENABLED, writer-schema will be picked such that table's schema (after txn) is either kept the same "
-        + "or extended, meaning that we'll always prefer the schema that either adds new columns or stays the same.");
+        + "or extended, meaning that we'll always prefer the schema that either adds new columns or stays the same. "
+        + "This enables us, to always extend the table's schema during evolution and never lose the data (when, for "
+        + "ex, existing column is being dropped in a new batch)");
 ```
 
 当设置 `hoodie.datasource.write.reconcile.schema=true` 时，即使没有历史 Schema Evolution 记录，也会启动 Schema 对齐流程。这是从"非 Schema Evolution 模式"迁移到"Schema Evolution 模式"的入口。

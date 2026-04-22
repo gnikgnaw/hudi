@@ -294,7 +294,7 @@ public enum PartitionTTLStrategyType {
 
 只有两种内建策略类型。用户也可以通过 `hoodie.partition.ttl.strategy.class` 配置自定义策略类。
 
-> **源码Bug警告：** 在 v1.2.0-SNAPSHOT 中，`PartitionTTLStrategyType.getPartitionTTLStrategyClassName()` 方法的第69行错误地使用了 `KeyGeneratorType.valueOf()` 而不是 `PartitionTTLStrategyType.valueOf()`。这会导致通过 `hoodie.partition.ttl.management.strategy.type` 配置策略类型时失败。实际使用中应该通过 `HoodiePartitionTTLStrategyFactory` 来创建策略实例，该工厂类正确实现了策略解析逻辑。
+> **源码Bug警告：** 在 v1.2.0-SNAPSHOT 中，`PartitionTTLStrategyType.getPartitionTTLStrategyClassName()` 方法的第70行错误地使用了 `KeyGeneratorType.valueOf()` 而不是 `PartitionTTLStrategyType.valueOf()`。这会导致通过 `hoodie.partition.ttl.management.strategy.type` 配置策略类型时失败。实际使用中应该通过 `HoodiePartitionTTLStrategyFactory` 来创建策略实例，该工厂类正确实现了策略解析逻辑（使用 `PartitionTTLStrategyType.valueOf(strategyType.toUpperCase(Locale.ROOT))`）。
 
 ## 1.6 HoodiePartitionTTLStrategyFactory 工厂
 
@@ -775,7 +775,7 @@ public List<WriteStatus> logCompact(...) {
 
 | 配置项 | 默认值 | 说明 | Since 版本 |
 |-------|-------|------|-----------|
-| `hoodie.log.compaction.enable` | `false` | 是否启用 Log Compaction | 0.14.0 |
+| `hoodie.log.compaction.enable` | `false` | 是否启用 Log Compaction（也会为元数据表启用） | 0.14.0 |
 | `hoodie.log.compaction.inline` | `false` | 是否内联执行 Log Compaction | 0.13.0 |
 | `hoodie.log.compaction.blocks.threshold` | `5` | 触发 Log Compaction 的 log blocks/files 阈值 | 0.13.0 |
 

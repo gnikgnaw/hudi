@@ -52,7 +52,7 @@ public static final Pattern LOG_FILE_PATTERN =
 
 ### 2.3 Log File 的排序规则
 
-`HoodieLogFile.LogFileComparator` 定义了 Log File 的排序规则（源码 `HoodieLogFile.java:201-241`）：
+`HoodieLogFile.LogFileComparator` 定义了 Log File 的排序规则（源码 `HoodieLogFile.java:201-242`）：
 
 ```
 优先级: deltaCommitTime > logVersion > logWriteToken > suffix
@@ -82,6 +82,10 @@ private void rollOver() throws IOException {
 
 ```java
 public HoodieLogFile rollOver(String logWriteToken) {
+    String fileId = getFileId();
+    String deltaCommitTime = getDeltaCommitTime();
+    StoragePath path = getPath();
+    String extension = "." + fileExtension;
     return new HoodieLogFile(new StoragePath(path.getParent(),
         FSUtils.makeLogFileName(fileId, extension, deltaCommitTime, logVersion + 1, logWriteToken)));
 }
@@ -267,7 +271,7 @@ HFile 格式的数据 Block，主要用于 Hudi Metadata Table。
 
 存储一批需要删除的记录键。
 
-**Content 内部格式**（`getContentBytes()` 方法，第 93-109 行）：
+**Content 内部格式**（`getContentBytes()` 方法，第 93-110 行）：
 
 ```
 +--------------------+
@@ -623,10 +627,21 @@ protected <T> void processNextRecord(HoodieRecord<T> newRecord) throws IOExcepti
     String key = newRecord.getRecordKey();
     HoodieRecord<T> prevRecord = records.get(key);
     if (prevRecord != null) {
-        // 执行 pre-combine 合并
-        BufferedRecord<T> combinedRecord = recordMerger.merge(prevBuffered, newBuffered, ...);
-        records.put(key, latestHoodieRecord.copy());
+        // Merge and store the combined record
+        RecordContext recordContext = AvroRecordContext.getFieldAccessorInstance();
+        BufferedRecord<T> prevBufferedRecord = BufferedRecords.fromHoodieRecord(prevRecord, readerSchema,
+            recordContext, this.getPayloadProps(), orderingFields, deleteContext);
+        BufferedRecord<T> newBufferedRecord = BufferedRecords.fromHoodieRecord(newRecord, readerSchema,
+            recordContext, this.getPayloadProps(), orderingFields, deleteContext);
+        BufferedRecord<T> combinedRecord = recordMerger.merge(prevBufferedRecord, newBufferedRecord, recordContext, this.getPayloadProps());
+        // If pre-combine returns existing record, no need to update it
+        if (combinedRecord.getRecord() != prevRecord.getData()) {
+            HoodieRecord combinedHoodieRecord = recordContext.constructFinalHoodieRecord(combinedRecord);
+            HoodieRecord latestHoodieRecord = getLatestHoodieRecord(newRecord, combinedHoodieRecord, key);
+            records.put(key, latestHoodieRecord.copy());
+        }
     } else {
+        // Put the record as is
         records.put(key, newRecord.copy());
     }
 }
@@ -639,13 +654,30 @@ protected void processNextDeletedRecord(DeleteRecord deleteRecord) {
     String key = deleteRecord.getRecordKey();
     HoodieRecord oldRecord = records.get(key);
     if (oldRecord != null) {
-        // 比较 orderingValue，只有 DELETE 的 orderingValue >= 现有记录时才执行删除
-        Comparable curOrderingVal = oldRecord.getOrderingValue(...);
+        // Merge and store the merged record. The ordering val is taken to decide whether the same key record
+        // should be deleted or be kept. The old record is kept only if the DELETE record has smaller ordering val.
+        // For same ordering values, uses the natural order(arrival time semantics).
+        
+        Comparable curOrderingVal = oldRecord.getOrderingValue(this.readerSchema, this.hoodieTableMetaClient.getTableConfig().getProps(), orderingFields);
         Comparable deleteOrderingVal = deleteRecord.getOrderingValue();
-        if (curOrderingVal > deleteOrderingVal) return; // DELETE 已过时
+        // Checks the ordering value does not equal to 0
+        // because we use 0 as the default value which means natural order
+        boolean choosePrev = !OrderingValues.isDefault(deleteOrderingVal)
+            && OrderingValues.isSameClass(curOrderingVal, deleteOrderingVal)
+            && curOrderingVal.compareTo(deleteOrderingVal) > 0;
+        if (choosePrev) {
+            // The DELETE message is obsolete if the old message has greater orderingVal.
+            return;
+        }
     }
-    // 放入空记录标记删除
-    records.put(key, emptyPayloadRecord);
+    // Put the DELETE record
+    if (recordType == HoodieRecord.HoodieRecordType.AVRO) {
+        records.put(key, HoodieRecordUtils.generateEmptyPayload(key,
+            deleteRecord.getPartitionPath(), deleteRecord.getOrderingValue(), getPayloadClassFQN()));
+    } else {
+        HoodieEmptyRecord record = new HoodieEmptyRecord<>(new HoodieKey(key, deleteRecord.getPartitionPath()), null, deleteRecord.getOrderingValue(), recordType);
+        records.put(key, record);
+    }
 }
 ```
 
@@ -722,7 +754,7 @@ private volatile long estimatedPayloadSize;
 
 ### 9.3 put 操作的分流策略
 
-`put()` 方法（第 212-242 行）核心逻辑：
+`put()` 方法（第 213-242 行）核心逻辑：
 
 ```java
 public R put(T key, R value) {
@@ -738,7 +770,8 @@ public R put(T key, R value) {
         } else if (inMemoryMap.size() % 100 == 0) {
             // 指数移动平均：90% 旧值 + 10% 新值
             estimatedPayloadSize = (long)(estimatedPayloadSize * 0.9
-                + (keySize + valueSize) * 0.1);
+                + (keySizeEstimator.sizeEstimate(key) + valueSizeEstimator.sizeEstimate(value)) * 0.1);
+            currentInMemoryMapSize = inMemoryMap.size() * estimatedPayloadSize;
         }
         currentInMemoryMapSize += estimatedPayloadSize;
         // 如果 key 之前在磁盘上，先从磁盘删除避免重复

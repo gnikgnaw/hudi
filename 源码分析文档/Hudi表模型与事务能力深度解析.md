@@ -188,11 +188,13 @@ public class HoodieFileGroup implements Serializable {
     @Getter
     private final HoodieFileGroupId fileGroupId;
     
-    // 按 commit time 倒序排列的 FileSlice
+    // 按 commit time 倒序排列的 FileSlice（key 是 baseInstantTime）
     private final TreeMap<String, FileSlice> fileSlices;
     
     // 关联的 Timeline（用于判断哪些 Instant 已完成）
     @Getter
+    @EqualsAndHashCode.Exclude
+    @ToString.Exclude
     private final HoodieTimeline timeline;
     
     // 最后一个已完成的 Instant（高水位线）
@@ -359,16 +361,16 @@ public class HoodieTableMetaClient implements Serializable {
 
 ```java
 public enum HoodieTableVersion {
-  ZERO(0, ["0.3.0"], LAYOUT_VERSION_0),     // 最早版本
-  ONE(1, ["0.6.0"], LAYOUT_VERSION_1),      // 添加 log file format
-  TWO(2, ["0.9.0"], LAYOUT_VERSION_1),      // 添加 timeline layout version
-  THREE(3, ["0.10.0"], LAYOUT_VERSION_1),   // 添加 partition fields
-  FOUR(4, ["0.11.0"], LAYOUT_VERSION_1),    // 添加 CDC support
-  FIVE(5, ["0.12.0","0.13.0"], LAYOUT_VERSION_1), // Metadata Table
-  SIX(6, ["0.14.0"], LAYOUT_VERSION_1),     // InternalSchema
-  SEVEN(7, ["0.16.0"], LAYOUT_VERSION_1),   // Timeline Layout V1
-  EIGHT(8, ["1.0.0"], LAYOUT_VERSION_2),    // ★ 里程碑：Timeline Layout V2
-  NINE(9, ["1.1.0"], LAYOUT_VERSION_2);     // 当前最新版本
+  ZERO(0, CollectionUtils.createImmutableList("0.3.0"), TimelineLayoutVersion.LAYOUT_VERSION_0),
+  ONE(1, CollectionUtils.createImmutableList("0.6.0"), TimelineLayoutVersion.LAYOUT_VERSION_1),
+  TWO(2, CollectionUtils.createImmutableList("0.9.0"), TimelineLayoutVersion.LAYOUT_VERSION_1),
+  THREE(3, CollectionUtils.createImmutableList("0.10.0"), TimelineLayoutVersion.LAYOUT_VERSION_1),
+  FOUR(4, CollectionUtils.createImmutableList("0.11.0"), TimelineLayoutVersion.LAYOUT_VERSION_1),
+  FIVE(5, CollectionUtils.createImmutableList("0.12.0", "0.13.0"), TimelineLayoutVersion.LAYOUT_VERSION_1),
+  SIX(6, CollectionUtils.createImmutableList("0.14.0"), TimelineLayoutVersion.LAYOUT_VERSION_1),
+  SEVEN(7, CollectionUtils.createImmutableList("0.16.0"), TimelineLayoutVersion.LAYOUT_VERSION_1),
+  EIGHT(8, CollectionUtils.createImmutableList("1.0.0"), TimelineLayoutVersion.LAYOUT_VERSION_2),  // ★ 里程碑：Timeline Layout V2
+  NINE(9, CollectionUtils.createImmutableList("1.1.0"), TimelineLayoutVersion.LAYOUT_VERSION_2);   // 当前最新版本
 }
 ```
 

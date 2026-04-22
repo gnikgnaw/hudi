@@ -1,9 +1,9 @@
 # Hudi 索引机制深度解析
 
 > 基于 Apache Hudi 源码深度分析（已纠错 + 扩展）
-> 文档版本：4.0
+> 文档版本：4.1
 > 源码版本：v1.2.0-SNAPSHOT (master)
-> 最后更新：2026-04-15
+> 最后更新：2026-04-21
 
 ---
 
@@ -106,8 +106,17 @@ public abstract class HoodieIndex<I, O> implements Serializable {
     // ★ 核心属性 3：是否隐式索引
     public abstract boolean isImplicitWithStorage();
 
-    // 是否需要 tagLocation（某些操作不需要，如 INSERT_OVERWRITE）
-    public boolean requiresTagging(WriteOperationType operationType) { ... }
+    // 是否需要 tagLocation（某些操作不需要）
+    public boolean requiresTagging(WriteOperationType operationType) {
+        switch (operationType) {
+            case DELETE:
+            case DELETE_PREPPED:
+            case UPSERT:
+                return true;
+            default:
+                return false;
+        }
+    }
 
     // 回滚 commit
     public abstract boolean rollbackCommit(String instantTime);
@@ -383,9 +392,11 @@ public abstract class HoodieBucketIndex extends HoodieIndex<Object, Object> {
             case INSERT_OVERWRITE:
             case UPSERT:
             case DELETE:
+            case DELETE_PREPPED:
             case BULK_INSERT:
                 return true;
-            default: return false;
+            default:
+                return false;
         }
     }
 }
@@ -1093,7 +1104,7 @@ HoodieWriteConfig otherConfig = HoodieWriteConfig.newBuilder()
 
 ---
 
-**文档版本**: 4.0（纠错 + 大幅扩展 + 源码深度剖析）
+**文档版本**: 4.1（源码验证通过 + 细节修正）
 **创建日期**: 2026-04-14
-**最后更新**: 2026-04-15
+**最后更新**: 2026-04-21
 **基于 Hudi 版本**: v1.2.0-SNAPSHOT (master)

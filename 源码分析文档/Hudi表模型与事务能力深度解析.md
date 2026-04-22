@@ -185,12 +185,14 @@ Compaction 后 (T4):
 ```java
 public class HoodieFileGroup implements Serializable {
     // 文件组 ID（partitionPath + fileId 组合）
+    @Getter
     private final HoodieFileGroupId fileGroupId;
     
     // 按 commit time 倒序排列的 FileSlice
     private final TreeMap<String, FileSlice> fileSlices;
     
     // 关联的 Timeline（用于判断哪些 Instant 已完成）
+    @Getter
     private final HoodieTimeline timeline;
     
     // 最后一个已完成的 Instant（高水位线）
@@ -207,12 +209,15 @@ public class HoodieFileGroup implements Serializable {
 ```java
 public class FileSlice implements Serializable {
     // 文件组 ID
+    @Getter
     private final HoodieFileGroupId fileGroupId;
     
     // Base Instant Time（本切片对应的基础时间戳）
+    @Getter
     private final String baseInstantTime;
     
     // 基础文件（Parquet/ORC，可选——可能只有 Log Files）
+    @Setter
     private HoodieBaseFile baseFile;
     
     // 日志文件（TreeSet，按版本倒序排列——大版本号在前）
@@ -292,7 +297,7 @@ public class HoodieTableMetaClient implements Serializable {
 }
 ```
 
-**纠错说明**：原文档中 `HoodieTableMetaClient` 的字段列表不完整。实际类比文档描述多出 `timelineLayout`、`timelinePath`、`timelineHistoryPath`、`tableFormat`、`storageConf` 等关键字段。特别是 `TimelineLayout` 是 Timeline V1/V2 切换的核心机制。
+**关键字段说明**：`HoodieTableMetaClient` 包含了表的所有元数据信息，其中 `timelineLayout` 是 Timeline V1/V2 切换的核心机制，`tableFormat` 标识表格式（Native Hudi 等），`storageConf` 提供存储配置抽象。
 
 ### 4.2 目录结构（完整版）
 
@@ -392,7 +397,7 @@ public class HoodieInstant implements Serializable, Comparable<HoodieInstant> {
     private final String action;          // 操作类型
     private final String requestedTime;   // 请求时间（唯一标识）
     private final String completionTime;  // 完成时间（V2 新增，可为 null）
-    private boolean isLegacy = false;     // 是否旧格式（表版本 < 7）
+    private boolean isLegacy = false;     // 是否旧格式（表版本 < 8）
     private final Comparator<HoodieInstant> comparator;  // 排序比较器
 
     public enum State {
@@ -404,7 +409,7 @@ public class HoodieInstant implements Serializable, Comparable<HoodieInstant> {
 }
 ```
 
-**纠错说明**：原文档中 `HoodieInstant` 列出了 `getTimestamp()` 等方法，实际源码中获取时间用的是 `requestedTime()` 和 `getCompletionTime()`。`equals()` 方法只比较 `state`、`action`、`requestedTime` 三个字段，**不比较 completionTime**。
+**关键设计**：`equals()` 方法只比较 `state`、`action`、`requestedTime` 三个字段，**不比较 completionTime**。这意味着两个 instant 即使完成时间不同，只要请求时间、操作类型和状态相同，就被认为是同一个 instant。
 
 ### 5.3 Instant 状态转换
 
@@ -540,7 +545,9 @@ public enum RecordMergeMode {
 
 ```java
 public class TransactionManager implements Serializable, AutoCloseable {
+    @Getter
     protected final LockManager lockManager;
+    @Getter
     protected final boolean isLockRequired;
     protected Option<HoodieInstant> changeActionInstant = Option.empty();
     private Option<HoodieInstant> lastCompletedActionInstant = Option.empty();
@@ -659,13 +666,15 @@ public interface ConflictResolutionStrategy {
 
 ### 8.2 冲突检测策略
 
-**纠错**：原文档列出的 `EarlyConflictDetectionStrategy` 和 `TimelineServerBasedDetectionStrategy` **不是** `ConflictResolutionStrategy` 的实现。它们属于**早期冲突检测**机制，是一个独立的体系。
+**关键区分**：`ConflictResolutionStrategy` 是提交时的冲突解决策略，而 `EarlyConflictDetectionStrategy`（包括 `DirectMarkerBasedDetectionStrategy` 和 `TimelineServerBasedDetectionStrategy`）是写入过程中的早期冲突检测机制，两者是独立的体系。
 
-实际的 `ConflictResolutionStrategy` 实现是：
+实际的 `ConflictResolutionStrategy` 实现包括：
 
 | 策略类 | 描述 |
 |--------|------|
 | `SimpleConcurrentFileWritesConflictResolutionStrategy` | 文件级冲突检测：如果两个操作修改了相同的 FileGroup 则冲突 |
+| `BucketIndexConcurrentFileWritesConflictResolutionStrategy` | Bucket Index 场景的冲突解决策略 |
+| `SimpleSchemaConflictResolutionStrategy` | Schema 冲突解决策略 |
 
 ### 8.3 冲突检测流程
 
@@ -749,7 +758,7 @@ public class LockManager implements Serializable, AutoCloseable {
 
 ### 9.2 LockProvider 实现（完整清单）
 
-**纠错**：原文档只列了4种锁实现，实际源码中有 **8 种**：
+实际源码中的主要 LockProvider 实现：
 
 | LockProvider | 模块 | 说明 | 适用场景 |
 |-------------|------|------|---------|
@@ -759,11 +768,10 @@ public class LockManager implements Serializable, AutoCloseable {
 | `ZookeeperBasedLockProvider` | hudi-client-common | 基于 ZooKeeper 的分布式锁（继承 `BaseZookeeperBasedLockProvider`） | 多 Writer 标准方案 |
 | `ZookeeperBasedImplicitBasePathLockProvider` | hudi-client-common | 基于 ZooKeeper 的分布式锁（自动推断 lock path） | 多 Writer 简化配置 |
 | `HiveMetastoreBasedLockProvider` | hudi-hive-sync | 基于 Hive Metastore 的锁 | Hive 集成场景 |
-| `DynamoDBBasedLockProvider` | hudi-aws | 基于 AWS DynamoDB 的锁（继承 `DynamoDBBasedLockProviderBase`） | AWS 场景 |
-| `NoopLockProvider` | hudi-common | 空操作锁（不加锁）| 测试/调试 |
+| `DynamoDBBasedLockProvider` | hudi-aws | 基于 AWS DynamoDB 的锁 | AWS 场景 |
 | 自定义实现 | 用户代码 | 用户实现 `LockProvider` 接口 | 特殊需求 |
 
-**说明**：`BaseZookeeperBasedLockProvider` 和 `DynamoDBBasedLockProviderBase` 是抽象基类，用户配置时应使用具体实现类 `ZookeeperBasedLockProvider` 和 `DynamoDBBasedLockProvider`。
+**说明**：`BaseZookeeperBasedLockProvider` 是抽象基类，用户配置时应使用具体实现类 `ZookeeperBasedLockProvider` 或 `ZookeeperBasedImplicitBasePathLockProvider`。
 
 ### 9.3 锁配置最佳实践
 
@@ -806,14 +814,16 @@ Writer B 开始写入: 创建 marker 文件 → 检查是否已有同 fileId 的
 Writer A 开始写入: ... (1小时后) ... commit → 冲突检测 → 冲突！浪费1小时
 ```
 
-### 10.2 两种策略
+### 10.2 两种早期冲突检测策略
 
 **源码位置**: `hudi-common/src/main/java/org/apache/hudi/common/conflict/detection/`
 
 | 策略 | 类名 | 说明 |
 |------|------|------|
-| 直接 Marker | `DirectMarkerBasedDetectionStrategy` | 每个 Writer 直接在文件系统上创建 marker 文件 |
-| Timeline Server Marker | `TimelineServerBasedDetectionStrategy` | 通过 Timeline Server 集中管理 marker |
+| 直接 Marker | `DirectMarkerBasedDetectionStrategy` | 每个 Writer 直接在文件系统上创建 marker 文件进行冲突检测 |
+| Timeline Server Marker | `TimelineServerBasedDetectionStrategy` | 通过 Timeline Server 集中管理 marker 进行冲突检测 |
+
+**注意**：这些是 `EarlyConflictDetectionStrategy` 接口的实现，用于写入过程中的早期冲突检测，与提交时的 `ConflictResolutionStrategy` 是不同的机制。
 
 **DirectMarkerBasedDetectionStrategy** 适合简单场景，但在 S3 等对象存储上，大量小文件的 LIST 操作代价高昂。
 
@@ -1178,11 +1188,11 @@ public enum MarkerType {
 ```
 WriteMarkers (抽象基类)
     │
-    ├── DirectWriteMarkers             (表版本 >= 8 的直接 marker)
+    ├── DirectWriteMarkers             (表版本 >= 7 的直接 marker)
     │   └── DirectWriteMarkersV1       (表版本 <= 6 的直接 marker，支持 APPEND 类型)
     │       implements AppendMarkerHandler
     │
-    ├── TimelineServerBasedWriteMarkers    (表版本 >= 8 的 Timeline Server marker)
+    ├── TimelineServerBasedWriteMarkers    (表版本 >= 7 的 Timeline Server marker)
     │   └── TimelineServerBasedWriteMarkersV1  (表版本 <= 6 的 Timeline Server marker)
     │       implements AppendMarkerHandler
     │

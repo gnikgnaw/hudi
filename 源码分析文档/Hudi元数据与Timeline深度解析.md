@@ -1,9 +1,9 @@
 # Hudi 元数据与 Timeline 深度解析
 
-> 基于 Apache Hudi 源码深度分析（已纠错 + 扩展 + 源码深度剖析）
-> 文档版本：4.0
+> 基于 Apache Hudi 源码深度分析
+> 文档版本：5.0
 > 源码版本：v1.2.0-SNAPSHOT (master)
-> 最后更新：2026-04-15
+> 最后更新：2026-04-21
 
 ---
 
@@ -15,7 +15,7 @@
 4. [文件系统视图 — FileSystemView](#4-文件系统视图-filesystemview)
 5. [Metadata Table 深度解析](#5-metadata-table-深度解析)
 6. [HoodieTableMetaClient — 元数据客户端](#6-hoodietablemetaclient-元数据客户端)
-7. [Timeline Server — 嵌入式元数据服务](#7-timeline-server)
+7. [Timeline Server — 嵌入式元数据服务](#7-timeline-server-嵌入式元数据服务)
 8. [与 Iceberg 元数据体系的对比](#8-与-iceberg-元数据体系的对比)
 9. [元数据源码深度剖析](#9-元数据源码深度剖析)
 
@@ -107,7 +107,7 @@ Timeline 不仅是操作日志，更是 Hudi 实现以下能力的基础：
 
 ### 2.2 HoodieActiveTimeline — 接口与实现
 
-**纠错**：原文档将 `HoodieActiveTimeline` 描述为类，实际上它是**接口**。
+`HoodieActiveTimeline` 是一个**接口**，定义了 Active Timeline 的核心操作。
 
 **源码位置**：`hudi-common/src/main/java/org/apache/hudi/common/table/timeline/HoodieActiveTimeline.java`
 
@@ -125,10 +125,11 @@ public interface HoodieActiveTimeline extends HoodieTimeline {
 ```
 HoodieActiveTimeline (接口)
     ↑ implements
-ActiveTimelineV1 extends BaseTimelineV1  ← 表版本 ≤ 7
-ActiveTimelineV2 extends BaseTimelineV2  ← 表版本 ≥ 8
+ActiveTimelineV1 (类) extends BaseTimelineV1  ← 表版本 ≤ 7
+ActiveTimelineV2 (类) extends BaseTimelineV2  ← 表版本 ≥ 8
 
 BaseTimelineV1/V2 (抽象类)
+    ├── 继承自 BaseHoodieTimeline
     ├── 管理 Instant 列表
     ├── 文件命名规则
     └── 序列化/反序列化
@@ -187,7 +188,9 @@ Active Timeline ──────────────────── Arc
 
 ## 3. HoodieInstant — 时间点
 
-### 3.1 结构（已验证）
+### 3.1 结构
+
+**源码位置**：`hudi-common/src/main/java/org/apache/hudi/common/table/timeline/HoodieInstant.java`
 
 ```java
 public class HoodieInstant implements Serializable, Comparable<HoodieInstant> {
@@ -199,11 +202,19 @@ public class HoodieInstant implements Serializable, Comparable<HoodieInstant> {
     private final Comparator<HoodieInstant> comparator;
 }
 
+// State 枚举定义
+public enum State {
+    REQUESTED,   // 请求状态（Compaction/Clustering 计划）
+    INFLIGHT,    // 执行中
+    COMPLETED,   // 已完成
+    NIL          // 无效状态
+}
+
 // equals() 只比较 state + action + requestedTime，不比较 completionTime
 // 这意味着同一个操作在不同状态下（如 INFLIGHT vs COMPLETED）是不同的 Instant
 ```
 
-### 3.2 Action 类型全景（纠正补全）
+### 3.2 Action 类型全景
 
 | Action | 说明 | 适用表类型 | 对应的 Commit Metadata 类 |
 |--------|------|-----------|-------------------------|
@@ -245,7 +256,7 @@ FileSystemView 推导:
     fg2 → FileSlice(base=fg2_v1, logs=[])
 ```
 
-### 4.2 实现类全景（纠正补全）
+### 4.2 实现类全景
 
 **源码位置**：`hudi-common/src/main/java/org/apache/hudi/common/table/view/`
 
@@ -327,24 +338,28 @@ FileSystemViewManager.createViewManager()
   4. 利用 Hudi 自身的 HFile 格式做快速 key 查找
 ```
 
-### 5.2 Metadata Table 分区（纠正补全）
+### 5.2 Metadata Table 分区类型
 
 **源码位置**：`hudi-common/src/main/java/org/apache/hudi/metadata/MetadataPartitionType.java`
 
 ```java
 public enum MetadataPartitionType {
-    FILES,               // 文件列表（Record Type 2）
-    ALL_PARTITIONS,      // 全量分区列表（Record Type 1，复用 FILES 分区）
-    COLUMN_STATS,        // 列统计（Record Type 3）
-    BLOOM_FILTERS,       // Bloom Filter（Record Type 4）
-    RECORD_INDEX,        // Record Level Index（Record Type 5）
-    PARTITION_STATS,     // 分区统计（Record Type 6）
-    SECONDARY_INDEX,     // 二级索引（Record Type 7）
-    EXPRESSION_INDEX     // 表达式索引（动态前缀，Record Type -1）
+    FILES(PARTITION_NAME_FILES, "files-", 2),
+    COLUMN_STATS(PARTITION_NAME_COLUMN_STATS, "col-stats-", 3),
+    BLOOM_FILTERS(PARTITION_NAME_BLOOM_FILTERS, "bloom-filters-", 4),
+    RECORD_INDEX(PARTITION_NAME_RECORD_INDEX, "record-index-", 5),
+    EXPRESSION_INDEX(PARTITION_NAME_EXPRESSION_INDEX_PREFIX, "expr-index-", -1),
+    SECONDARY_INDEX(PARTITION_NAME_SECONDARY_INDEX_PREFIX, "secondary-index-", 7),
+    PARTITION_STATS(PARTITION_NAME_PARTITION_STATS, "partition-stats-", 6),
+    ALL_PARTITIONS(PARTITION_NAME_FILES, "files-", 1);  // 复用 FILES 分区
 }
 ```
 
-**纠错**：原文档只列了 6 种分区，实际有 8 种。`ALL_PARTITIONS` 和 `EXPRESSION_INDEX` 被遗漏。
+**说明**：
+- 共 8 种分区类型，每种有对应的 Record Type（整数标识）
+- `ALL_PARTITIONS` 是特殊类型，与 `FILES` 共享同一物理分区（都是 `files/`），只是记录类型不同（1 vs 2）
+- `EXPRESSION_INDEX` 的 Record Type 为 -1，表示动态类型
+- 每个分区类型有独立的 fileId 前缀（如 `files-`、`col-stats-` 等）
 
 ### 5.3 FILES 分区 — 替代文件系统 LIST
 
@@ -397,7 +412,7 @@ HoodieTableMetadataWriter.updateFromWriteStatuses()
 
 ## 6. HoodieTableMetaClient — 元数据统一入口
 
-### 6.1 核心字段（已验证）
+### 6.1 核心字段
 
 ```java
 public class HoodieTableMetaClient implements Serializable {
@@ -955,7 +970,7 @@ V2 中已完成的 Instant 文件名格式为 `<requestedTime>_<completionTime>.
 
 ---
 
-**文档版本**: 4.0（纠错 + 扩展 + 源码深度剖析）
+**文档版本**: 5.0（技术细节验证完成）
 **创建日期**: 2026-04-14
-**最后更新**: 2026-04-15
+**最后更新**: 2026-04-21
 **基于 Hudi 版本**: v1.2.0-SNAPSHOT (master)

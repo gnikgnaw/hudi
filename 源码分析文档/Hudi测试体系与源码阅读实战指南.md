@@ -637,7 +637,7 @@ public class TestHoodieClientMultiWriter extends HoodieClientTestBase {
 
 ### 7.2 Profile 如何过滤标签
 
-**unit-tests Profile 配置**（摘自 pom.xml 第2046行）：
+**unit-tests Profile 配置**（摘自 pom.xml）：
 
 ```xml
 <profile>
@@ -671,7 +671,7 @@ public class TestHoodieClientMultiWriter extends HoodieClientTestBase {
 - `<excludedGroups>functional,functional-b,functional-c</excludedGroups>` -- 排除所有带 `@Tag("functional")` 等标签的测试
 - `<excludes>` -- 排除集成测试（IT*.java）和测试套件
 
-**functional-tests Profile 配置**（摘自 pom.xml 第2097行）：
+**functional-tests Profile 配置**（摘自 pom.xml）：
 
 ```xml
 <profile>
@@ -2281,8 +2281,8 @@ export JAVA_HOME=/path/to/jdk17
 
 **解决方案**：
 ```bash
-# 增加测试 JVM 内存
-mvn test -pl <module> -Dargline="-Xmx4g -Xms256m"
+# 增加测试 JVM 内存（注意：argLine 中的 L 是大写）
+mvn test -pl <module> -DargLine="-Xmx4g -Xms256m"
 ```
 
 #### 问题2：端口绑定失败

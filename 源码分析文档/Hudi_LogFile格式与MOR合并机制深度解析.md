@@ -902,23 +902,21 @@ public Iterator<R> iterator() {
 
 ### 10.3 位置信息的写入
 
-在 `HoodieLogBlock.addRecordPositionsIfRequired()` 方法（第 374-396 行）中：
+位置信息的写入逻辑在 `HoodieLogBlock` 类中实现。当 Block Header 包含 `BASE_FILE_INSTANT_TIME_OF_RECORD_POSITIONS` 时，会调用相关方法将记录位置编码到 Header 中：
 
 ```java
-protected <T> void addRecordPositionsIfRequired(List<T> records, Function<T, Long> getPositionFunc) {
-    if (containsBaseFileInstantTimeOfPositions()) {
-        // 检查第一条记录是否有有效位置
-        if (!isPositionValid(getPositionFunc.apply(records.get(0)))) {
-            removeBaseFileInstantTimeOfPositions();
-            return;
+protected void addRecordPositionsToHeader(Set<Long> positionSet, int numRecords) {
+    if (positionSet.size() == numRecords) {
+        try {
+            logBlockHeader.put(HeaderMetadataType.RECORD_POSITIONS, 
+                LogReaderUtils.encodePositions(positionSet));
+        } catch (IOException e) {
+            LOG.error("Cannot write record positions to the log block header.", e);
         }
-        // 按位置排序记录
-        records.sort((o1, o2) -> Long.compare(
-            getPositionFunc.apply(o1), getPositionFunc.apply(o2)));
-        // 将位置集合编码到 Header
-        addRecordPositionsToHeader(
-            records.stream().map(getPositionFunc).collect(Collectors.toSet()),
-            records.size());
+    } else {
+        LOG.warn("There are duplicate keys in the records (number of unique positions: {}, "
+                + "number of records: {}). Skip writing record positions to the log block header.",
+            positionSet.size(), numRecords);
     }
 }
 ```
@@ -932,26 +930,38 @@ protected <T> void addRecordPositionsIfRequired(List<T> records, Function<T, Lon
 **processDataBlock 流程**（第 91-153 行）：
 
 ```java
+@Override
 public void processDataBlock(HoodieDataBlock dataBlock, Option<KeySpec> keySpecOpt) throws IOException {
     if (!readerContext.getShouldMergeUseRecordPosition()) {
         super.processDataBlock(dataBlock, keySpecOpt); // 降级到 key-based
         return;
     }
-
-    // 1. 从 Block Header 提取位置信息
+    // Extract positions from data block.
     List<Long> recordPositions = extractRecordPositions(dataBlock, baseFileInstantTime);
     if (recordPositions == null) {
+        LOG.debug("Falling back to key based merge for data block");
         fallbackToKeyBasedBuffer(); // 无位置信息，降级
         super.processDataBlock(dataBlock, keySpecOpt);
         return;
     }
 
-    // 2. 遍历记录，用 position 而非 key 作为 Map 的键
+    // 遍历记录，用 position 而非 key 作为 Map 的键
     try (ClosableIterator<T> recordIterator = dataBlock.getEngineRecordIterator(readerContext)) {
         int recordIndex = 0;
         while (recordIterator.hasNext()) {
             T nextRecord = recordIterator.next();
+            
+            // Skip a record if it is not contained in the specified keys.
+            if (shouldSkip(nextRecord, isFullKey, keys, dataBlock.getSchema())) {
+                recordIndex++;
+                continue;
+            }
+            
             long recordPosition = recordPositions.get(recordIndex++);
+            T evolvedNextRecord = schemaTransformerWithEvolvedSchema.getLeft().apply(nextRecord);
+            boolean isDelete = readerContext.getRecordContext().isDeleteRecord(evolvedNextRecord, deleteContext);
+            BufferedRecord<T> bufferedRecord = BufferedRecords.fromEngineRecord(evolvedNextRecord, schema, 
+                readerContext.getRecordContext(), orderingFieldNames, isDelete);
             processNextDataRecord(bufferedRecord, recordPosition);
         }
     }
@@ -961,7 +971,12 @@ public void processDataBlock(HoodieDataBlock dataBlock, Option<KeySpec> keySpecO
 **hasNextBaseRecord 合并流程**（第 230-239 行）：
 
 ```java
+@Override
 protected boolean hasNextBaseRecord(T baseRecord) throws IOException {
+    if (!readerContext.getShouldMergeUseRecordPosition()) {
+        return doHasNextFallbackBaseRecord(baseRecord);
+    }
+
     // 从 Base File 记录中提取行号
     nextRecordPosition = readerContext.getRecordContext().extractRecordPosition(
         baseRecord, readerSchema, ROW_INDEX_TEMPORARY_COLUMN_NAME, nextRecordPosition);
@@ -976,7 +991,7 @@ protected boolean hasNextBaseRecord(T baseRecord) throws IOException {
 
 ### 10.5 位置有效性检查与降级策略
 
-`extractRecordPositions()` 方法（第 288-317 行）执行严格的有效性检查：
+位置信息的提取在 `extractRecordPositions()` 方法中执行严格的有效性检查：
 
 ```java
 protected static List<Long> extractRecordPositions(HoodieLogBlock logBlock,
@@ -1009,6 +1024,7 @@ protected static List<Long> extractRecordPositions(HoodieLogBlock logBlock,
 ```java
 private void fallbackToKeyBasedBuffer() {
     readerContext.setShouldMergeUseRecordPosition(false);
+    //need to make a copy of the keys to avoid concurrent modification exception
     ArrayList<Serializable> positions = new ArrayList<>(records.keySet());
     for (Serializable position : positions) {
         BufferedRecord<T> entry = records.get(position);
@@ -1017,6 +1033,9 @@ private void fallbackToKeyBasedBuffer() {
             records.put(recordKey, entry);
             records.remove(position);
         } else {
+            //if it's a delete record and the key is null, then we need to still use positions
+            //this happens when we read the positions using logBlock.getRecordPositions()
+            //instead of reading the delete records themselves
             needToDoHybridStrategy = true;
         }
     }
@@ -1179,10 +1198,12 @@ Log File 的 Magic 标记、CRC 校验、双端长度记录（Header + Footer）
 | `HoodieMergedLogRecordScanner` | `hudi-common/.../table/log/HoodieMergedLogRecordScanner.java` | 合并 Scanner（旧体系） |
 | `HoodieUnMergedLogRecordScanner` | `hudi-common/.../table/log/HoodieUnMergedLogRecordScanner.java` | 不合并 Scanner |
 | `HoodieMergedLogRecordReader` | `hudi-common/.../table/log/HoodieMergedLogRecordReader.java` | 合并 Reader（新体系） |
+| `BaseHoodieLogRecordReader` | `hudi-common/.../table/log/BaseHoodieLogRecordReader.java` | Log Record Reader 基类（新体系） |
 | `ExternalSpillableMap` | `hudi-common/.../util/collection/ExternalSpillableMap.java` | 内存+磁盘两级 Map |
 | `BitCaskDiskMap` | `hudi-common/.../util/collection/BitCaskDiskMap.java` | BitCask 磁盘 Map |
 | `RocksDbDiskMap` | `hudi-common/.../util/collection/RocksDbDiskMap.java` | RocksDB 磁盘 Map |
 | `PositionBasedFileGroupRecordBuffer` | `hudi-common/.../table/read/buffer/PositionBasedFileGroupRecordBuffer.java` | 位置合并 Buffer |
+| `KeyBasedFileGroupRecordBuffer` | `hudi-common/.../table/read/buffer/KeyBasedFileGroupRecordBuffer.java` | 键合并 Buffer |
 | `HoodieFileGroupReader` | `hudi-common/.../table/read/HoodieFileGroupReader.java` | FileGroup 统一读取入口 |
 | `HoodieLogFile` | `hudi-common/.../model/HoodieLogFile.java` | Log File 元数据抽象 |
 | `FSUtils` | `hudi-common/.../common/fs/FSUtils.java` | 文件命名与路径工具 |

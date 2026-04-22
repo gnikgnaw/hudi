@@ -168,8 +168,8 @@ Step 5: 按权重分配
 
 | 参数 | 默认值 | 含义 |
 |------|--------|------|
-| `hoodie.parquet.max.file.size` | `125829120` (120MB) | 目标文件大小 |
-| `hoodie.parquet.small.file.limit` | `104857600` (100MB) | 小于此值视为小文件 |
+| `hoodie.parquet.max.file.size` | `125829120` (120MB) | 目标文件大小（单位字节）|
+| `hoodie.parquet.small.file.limit` | `104857600` (100MB) | 小于此值视为小文件（单位字节）|
 | `hoodie.copyonwrite.insert.auto.split` | `true` | 是否自动计算每 bucket 记录数 |
 | `hoodie.copyonwrite.insert.split.size` | `500000` | 手动模式下每 bucket 记录数 |
 
@@ -290,8 +290,8 @@ public Pair<List<HoodieCompactionOperation>, List<String>> orderAndFilter(
 | `hoodie.compact.inline.max.delta.commits` | `5` | 触发频率，越小越频繁 |
 | `hoodie.compaction.strategy` | `LogFileSizeBased...` | 大多数场景用默认即可 |
 | `hoodie.compaction.target.io` | `512000` (MB) | 单次 Compaction I/O 上限 |
-| `hoodie.compaction.logfile.size.threshold` | `0` | log 大小阈值（0=不过滤）|
-| `hoodie.compaction.logfile.num.threshold` | `0` | log 文件数阈值 |
+| `hoodie.compaction.logfile.size.threshold` | `0` | log 大小阈值（0=不过滤，单位字节）|
+| `hoodie.compaction.logfile.num.threshold` | `0` | log 文件数阈值（0=不过滤）|
 
 **运维经验**：
 - `target.io` 太小 → 每次只压缩少量文件，积压严重

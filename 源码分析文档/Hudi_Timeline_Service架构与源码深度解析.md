@@ -776,10 +776,6 @@ public abstract class Handler {
         this.timelineServiceConfig = timelineServiceConfig;
         this.viewManager = viewManager;
     }
-
-    protected HoodieStorage getStorage(String path) {
-        return HoodieStorageUtils.getStorage(path, conf);
-    }
 }
 ```
 

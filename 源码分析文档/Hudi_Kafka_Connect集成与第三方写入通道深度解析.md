@@ -63,7 +63,7 @@ hudi-kafka-connect/src/main/java/org/apache/hudi/connect/
 │   ├── KafkaConnectTransactionServices.java # 事务服务实现
 │   └── KafkaConnectConfigs.java         # 配置定义
 └── utils/
-    └── KafkaConnectUtils.java           # 工具类
+    └── KafkaConnectUtils.java           # 工具类（注意：实际路径在 connect/utils/）
 ```
 
 **Proto 定义文件：**

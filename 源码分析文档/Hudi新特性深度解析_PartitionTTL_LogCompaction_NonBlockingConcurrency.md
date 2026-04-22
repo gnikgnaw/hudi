@@ -276,10 +276,25 @@ public enum PartitionTTLStrategyType {
 
   @Getter
   private final String className;
+  
+  PartitionTTLStrategyType(String className) {
+    this.className = className;
+  }
+  
+  public static PartitionTTLStrategyType fromClassName(String className) {
+    for (PartitionTTLStrategyType type : PartitionTTLStrategyType.values()) {
+      if (type.getClassName().equals(className)) {
+        return type;
+      }
+    }
+    throw new IllegalArgumentException("No PartitionTTLStrategyType found for class name: " + className);
+  }
 }
 ```
 
 只有两种内建策略类型。用户也可以通过 `hoodie.partition.ttl.strategy.class` 配置自定义策略类。
+
+> **源码Bug警告：** 在 v1.2.0-SNAPSHOT 中，`PartitionTTLStrategyType.getPartitionTTLStrategyClassName()` 方法的第69行错误地使用了 `KeyGeneratorType.valueOf()` 而不是 `PartitionTTLStrategyType.valueOf()`。这会导致通过 `hoodie.partition.ttl.management.strategy.type` 配置策略类型时失败。实际使用中应该通过 `HoodiePartitionTTLStrategyFactory` 来创建策略实例，该工厂类正确实现了策略解析逻辑。
 
 ## 1.6 HoodiePartitionTTLStrategyFactory 工厂
 
@@ -756,11 +771,15 @@ public List<WriteStatus> logCompact(...) {
 
 ## 2.7 Log Compaction 配置
 
-| 配置项 | 默认值 | 说明 |
-|-------|-------|------|
-| `hoodie.log.compaction.enable` | `false` | 是否启用 Log Compaction |
-| `hoodie.log.compaction.inline` | `false` | 是否内联执行 Log Compaction |
-| `hoodie.log.compaction.blocks.threshold` | `5` | 触发 Log Compaction 的 log blocks/files 阈值 |
+源码路径：`hudi-client/hudi-client-common/src/main/java/org/apache/hudi/config/HoodieCompactionConfig.java`
+
+| 配置项 | 默认值 | 说明 | Since 版本 |
+|-------|-------|------|-----------|
+| `hoodie.log.compaction.enable` | `false` | 是否启用 Log Compaction | 0.14.0 |
+| `hoodie.log.compaction.inline` | `false` | 是否内联执行 Log Compaction | 0.13.0 |
+| `hoodie.log.compaction.blocks.threshold` | `5` | 触发 Log Compaction 的 log blocks/files 阈值 | 0.13.0 |
+
+> **注意：** `hoodie.log.compaction.enable` 和 `hoodie.log.compaction.inline` 是两个独立的配置项。前者控制是否启用 Log Compaction 功能，后者控制是否在写入时内联执行。通常两者需要同时设置为 `true`。
 
 ### 生产实践
 

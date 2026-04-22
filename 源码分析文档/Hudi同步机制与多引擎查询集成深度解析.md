@@ -220,7 +220,7 @@ public static void runHoodieMetaSync(String syncToolClassName, TypedProperties p
 | `hoodie.datasource.hive_sync.database` | default | 目标数据库名 |
 | `hoodie.datasource.hive_sync.table` | unknown | 目标表名 |
 | `hoodie.datasource.hive_sync.partition_fields` | "" | 分区字段 |
-| `hoodie.datasource.hive_sync.partition_extractor_class` | MultiPartKeysValueExtractor | 分区值提取器 |
+| `hoodie.datasource.hive_sync.partition_extractor_class` | org.apache.hudi.hive.MultiPartKeysValueExtractor | 分区值提取器 |
 | `hoodie.meta.sync.metadata_file_listing` | true | 是否使用 Metadata Table 进行文件列表 |
 | `hoodie.meta.sync.incremental` | true | 是否增量同步分区 |
 | `hoodie.datasource.meta_sync.condition.sync` | false | 是否仅在有变更时同步 |
@@ -287,7 +287,7 @@ protected void doSync() {
 `syncHoodieTable(tableName, useRealtimeInputFormat, readAsOptimized)` 方法是核心：
 
 ```
-syncHoodieTable()
+syncHoodieTable(tableName, useRealtimeInputFormat, readAsOptimized)
   |
   +-- 检查表是否存在
   |     |
@@ -1129,7 +1129,7 @@ if (failedMetaSyncs.nonEmpty) {
 | `hoodie.datasource.hive_sync.table` | unknown | 目标表名 |
 | `hoodie.datasource.hive_sync.base_file_format` | PARQUET | 基础文件格式 |
 | `hoodie.datasource.hive_sync.partition_fields` | "" | 分区字段（逗号分隔） |
-| `hoodie.datasource.hive_sync.partition_extractor_class` | MultiPartKeysValueExtractor | 分区值提取器类 |
+| `hoodie.datasource.hive_sync.partition_extractor_class` | org.apache.hudi.hive.MultiPartKeysValueExtractor | 分区值提取器类 |
 | `hoodie.meta.sync.metadata_file_listing` | true | 是否使用 Metadata Table 列文件 |
 | `hoodie.meta.sync.incremental` | true | 是否增量同步分区 |
 | `hoodie.datasource.meta_sync.condition.sync` | false | 是否仅在有变更时更新同步时间 |

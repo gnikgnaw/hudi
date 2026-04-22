@@ -273,9 +273,17 @@ public class StreamWriteFunction extends AbstractStreamWriteFunction<HoodieFlink
 
   // 记录合并器
   private transient BufferedRecordMerger<RowData> recordMerger;
+  private transient HoodieReaderContext<RowData> readerContext;
+  private transient List<String> orderingFieldNames;
 
   // 内存追踪器
   private transient TotalSizeTracer tracer;
+  
+  // 内存段池
+  protected transient MemorySegmentPool memorySegmentPool;
+  
+  // 记录转换器
+  protected transient RecordConverter recordConverter;
 
   // 指标
   protected transient FlinkStreamWriteMetrics writeMetrics;
@@ -306,8 +314,10 @@ public class StreamWriteFunction extends AbstractStreamWriteFunction<HoodieFlink
     // 初始化转换器
     initConverter();
     
-    // 注册指标
-    registerMetrics();
+    // 注册指标（如果有）
+    if (getRuntimeContext().getMetricGroup() != null) {
+      registerMetrics();
+    }
   }
 
   @Override
@@ -324,7 +334,40 @@ public class StreamWriteFunction extends AbstractStreamWriteFunction<HoodieFlink
   @Override
   public void snapshotState() {
     // Checkpoint 时刷新缓冲区
+    // 参数 false 表示不是最终刷新（endInput）
     flushRemaining(false);
+  }
+  
+  public void flushRemaining(boolean endInput) {
+    writeMetrics.startDataFlush();
+    this.currentInstant = instantToWrite(hasData());
+    final List<WriteStatus> writeStatus;
+    if (!buckets.isEmpty()) {
+      writeStatus = new ArrayList<>();
+      this.buckets.values()
+          // 记录按 bucket ID 分区，每批发送到写入器的记录属于一个 bucket
+          .forEach(bucket -> {
+            if (!bucket.isEmpty()) {
+              writeStatus.addAll(writeRecords(currentInstant, bucket));
+              bucket.dispose();
+            }
+          });
+    } else {
+      log.info("No data to write in subtask [{}] for instant [{}]", taskID, currentInstant);
+      writeStatus = Collections.emptyList();
+    }
+    final WriteMetadataEvent event = WriteMetadataEvent.builder()
+        .taskID(taskID)
+        .instantTime(currentInstant)
+        .writeStatus(writeStatus)
+        .lastBatch(true)
+        .endInput(endInput)
+        .build();
+    
+    this.eventGateway.sendEventToCoordinator(event);
+    this.buckets.clear();
+    this.tracer.reset();
+    writeMetrics.endDataFlush();
   }
 
   @Override
@@ -393,11 +436,12 @@ public class StreamWriteOperatorCoordinator
     this.metaClient = initTableIfNotExists(this.conf);
     
     // 创建写入客户端
-    this.writeClient = FlinkWriteClients.createWriteClient(conf);
-    this.writeClient.tryUpgrade(instant, this.metaClient);
+    this.writeClient = FlinkWriteClients.createWriteClient(conf, getRuntimeContext());
     
-    // 初始化元数据表
-    initMetadataTable(this.writeClient);
+    // 初始化元数据写入客户端（如果需要）
+    if (OptionsResolver.isMetadataTableEnabled(conf)) {
+      this.metadataWriteClient = FlinkWriteClients.createMetadataWriteClient(conf, getRuntimeContext());
+    }
     
     // 启动执行器
     this.executor = NonThrownExecutor.builder(log)
@@ -407,23 +451,40 @@ public class StreamWriteOperatorCoordinator
   }
 
   @Override
-  public void notifyCheckpointComplete(long checkpointId) throws Exception {
+  public void notifyCheckpointComplete(long checkpointId) {
     // Checkpoint 完成时提交 Instant
     executor.execute(() -> {
+      // 流式模式下，提交所有已接收的事件
+      // 流式写入任务同步快照和刷新数据缓冲区
+      // 因此成功的 checkpoint 会包含旧的 checkpoint（遵循 checkpoint 包含契约）
       EventBuffer eventBuffer = eventBuffers.getEventBuffer(checkpointId);
       if (eventBuffer != null) {
         String instant = eventBuffer.getInstant();
-        commitInstant(instant);
+        doCommit(checkpointId, instant, eventBuffer.getDataWriteResults(), eventBuffer.getIndexWriteResults());
       }
     });
   }
 
   @Override
-  public void handleCoordinationRequest(CoordinationRequest request) {
+  public CompletableFuture<CoordinationResponse> handleCoordinationRequest(CoordinationRequest request) {
     // 处理来自子任务的协调请求
-    instantRequestExecutor.execute(() -> {
+    // 返回 CompletableFuture 以支持异步响应
+    return CompletableFuture.supplyAsync(() -> {
       // 处理请求逻辑
-    });
+      return CoordinationResponseSerDe.INSTANCE.serialize(response);
+    }, instantRequestExecutor);
+  }
+  
+  @Override
+  public void handleEventFromOperator(int subtask, int attemptNumber, OperatorEvent operatorEvent) {
+    handleEventFromOperator(subtask, operatorEvent);
+  }
+  
+  public void handleEventFromOperator(int subtask, OperatorEvent operatorEvent) {
+    ValidationUtils.checkState(operatorEvent instanceof WriteMetadataEvent,
+        "The coordinator can only handle WriteMetadataEvent");
+    WriteMetadataEvent event = (WriteMetadataEvent) operatorEvent;
+    // 处理写入元数据事件
   }
 }
 ```
@@ -598,14 +659,24 @@ private transient Map<String, RowDataBucket> buckets;
 ### 5.3 缓冲区刷新策略
 
 ```java
-// 1. 缓冲区大小超过阈值（主动刷新）
-if (tracer.totalSize() > config.get(FlinkOptions.WRITE_BATCH_SIZE)) {
-  flushBucket(bucketId);
+// 1. 单个 Bucket 大小超过阈值（主动刷新）
+if (bucket.isFull()) {
+  if (flushBucket(bucket)) {
+    this.tracer.countDown(bucket.getBufferSize());
+    disposeBucket(bucket);
+  }
 }
 
 // 2. 内存耗尽（被动刷新）
-if (memorySegmentPool.isExhausted()) {
-  flushAllBuckets();
+// 当尝试缓冲记录失败时，刷新最大的 bucket
+if (!success) {
+  RowDataBucket bucketToFlush = this.buckets.values().stream()
+      .max(Comparator.comparingLong(RowDataBucket::getBufferSize))
+      .orElseThrow(NoSuchElementException::new);
+  if (flushBucket(bucketToFlush)) {
+    this.tracer.countDown(bucketToFlush.getBufferSize());
+    disposeBucket(bucketToFlush);
+  }
 }
 
 // 3. Checkpoint 开始（强制刷新）
@@ -1032,21 +1103,22 @@ public void start() throws Exception {
 #   - 内存充足：增加到 512MB 或 1GB，提高吞吐
 #   - 内存紧张：减少到 128MB，避免 OOM
 #   - 延迟敏感：减少到 64MB，保证及时性
-hoodie.write.batch.size=256MB
+write.batch.size=256
 
-# 缓冲区类型（默认 MEMORY）
-# 含义：缓冲区存储位置
+# 缓冲区类型（默认 NONE）
+# 含义：Append 模式下的缓冲区类型
 # 选项：
-#   - MEMORY：堆内存，快速但容易 OOM
-#   - SPILLABLE_DISK：溢出到磁盘，容量大但性能下降
-hoodie.write.buffer.type=MEMORY
+#   - NONE：无缓冲排序（默认）
+#   - BOUNDED_IN_MEMORY：双缓冲异步写入
+#   - DISRUPTOR：环形缓冲异步写入（推荐，吞吐更高）
+write.buffer.type=NONE
 
-# 缓冲区限制（默认 1GB）
-# 含义：缓冲区最大大小
+# 写入任务最大内存（默认 1GB）
+# 含义：单个写入任务的最大内存限制
 # 调优建议：
 #   - 根据可用内存调整
 #   - 一般设置为总内存的 30-50%
-hoodie.write.buffer.limit.bytes=1GB
+write.task.max.size=1024
 ```
 
 **调优示例**：
@@ -1056,26 +1128,26 @@ hoodie.write.buffer.limit.bytes=1GB
   - 内存充足（16GB+）
   - 对延迟不敏感
   配置：
-    hoodie.write.batch.size=1GB
-    hoodie.write.buffer.limit.bytes=4GB
+    write.batch.size=1024
+    write.task.max.size=4096
   效果：减少刷新次数，提高吞吐
 
 场景 2：低延迟场景
   - 需要秒级数据可见性
   - 内存有限
   配置：
-    hoodie.write.batch.size=64MB
-    hoodie.write.buffer.limit.bytes=512MB
+    write.batch.size=64
+    write.task.max.size=512
   效果：频繁刷新，保证及时性
 
 场景 3：内存紧张场景
   - 内存有限（4GB）
   - 需要稳定运行
   配置：
-    hoodie.write.batch.size=128MB
-    hoodie.write.buffer.limit.bytes=512MB
-    hoodie.write.buffer.type=SPILLABLE_DISK
-  效果：溢出到磁盘，避免 OOM
+    write.batch.size=128
+    write.task.max.size=512
+    write.buffer.memory.type=MANAGED
+  效果：使用 Flink 托管内存，避免 OOM
 ```
 
 ### 9.2 并行度优化
@@ -1101,7 +1173,7 @@ hoodie.write.buffer.limit.bytes=1GB
 #   - 一般设置为 CPU 核数的 1-2 倍
 #   - 数据量大：增加到 16-32
 #   - 数据量小：保持 4-8
-hoodie.flink.write.tasks=8
+write.tasks=8
 
 # Bootstrap 任务数（默认 4）
 # 含义：并行加载索引的 Task 数量
@@ -1109,7 +1181,7 @@ hoodie.flink.write.tasks=8
 #   - 一般设置为写入任务数的 1/2
 #   - 索引大：增加任务数
 #   - 索引小：减少任务数
-hoodie.index.bootstrap.tasks=4
+index.bootstrap.tasks=4
 
 # Compaction 并行度（默认 4）
 # 含义：并行执行 Compaction 的 Task 数量
@@ -1117,7 +1189,7 @@ hoodie.index.bootstrap.tasks=4
 #   - 一般设置为写入任务数的 1/2
 #   - 文件多：增加任务数
 #   - 文件少：减少任务数
-hoodie.flink.compaction.tasks=4
+compaction.tasks=4
 ```
 
 **调优示例**：
@@ -1127,27 +1199,27 @@ hoodie.flink.compaction.tasks=4
   - 数据量大（TB 级）
   - 资源充足（32 核 CPU）
   配置：
-    hoodie.flink.write.tasks=32
-    hoodie.index.bootstrap.tasks=16
-    hoodie.flink.compaction.tasks=16
+    write.tasks=32
+    index.bootstrap.tasks=16
+    compaction.tasks=16
   效果：充分利用资源，提高吞吐
 
 场景 2：资源有限场景
   - 数据量中等（GB 级）
   - 资源有限（8 核 CPU）
   配置：
-    hoodie.flink.write.tasks=8
-    hoodie.index.bootstrap.tasks=4
-    hoodie.flink.compaction.tasks=4
+    write.tasks=8
+    index.bootstrap.tasks=4
+    compaction.tasks=4
   效果：平衡资源使用和性能
 
 场景 3：低延迟场景
   - 数据量小（MB 级）
   - 需要快速响应
   配置：
-    hoodie.flink.write.tasks=4
-    hoodie.index.bootstrap.tasks=2
-    hoodie.flink.compaction.tasks=2
+    write.tasks=4
+    index.bootstrap.tasks=2
+    compaction.tasks=2
   效果：减少调度开销，降低延迟
 ```
 
@@ -1168,33 +1240,35 @@ hoodie.flink.compaction.tasks=4
 **参数配置**：
 
 ```properties
-# 异步 Compaction（默认 false）
+# 异步 Compaction（默认 true，MOR 表自动启用）
 # 含义：是否在后台异步执行 Compaction
 # 调优建议：
-#   - 生产环境：启用（true）
-#   - 开发环境：禁用（false）
-hoodie.compaction.async.enabled=true
+#   - 生产环境：保持默认启用（true）
+#   - 如需离线/独立作业 Compaction 可禁用（false）
+compaction.async.enabled=true
 
-# Compaction 策略（默认 num_commits）
+# Compaction 触发策略（默认 num_commits）
 # 含义：何时触发 Compaction
 # 选项：
-#   - num_commits：每 N 个 Commit 后触发
-#   - time_elapsed：每 N 分钟后触发
-#   - num_and_time：两个条件都满足时触发
-hoodie.compaction.strategy=num_commits
+#   - num_commits：每 N 个 Delta Commit 后触发（默认）
+#   - num_commits_after_last_request：自上次完成/请求以来 N 个 Delta Commit 后触发
+#   - time_elapsed：每 N 秒后触发
+#   - num_and_time：同时满足 num 与 time 条件
+#   - num_or_time：满足 num 或 time 任一条件
+compaction.trigger.strategy=num_commits
 
-# Compaction 触发条件（默认 10）
+# Compaction 触发条件（默认 5）
 # 含义：多少个 Commit 后触发 Compaction
 # 调优建议：
 #   - 数据量大：减少到 5-10，更频繁地 Compaction
 #   - 数据量小：增加到 20-30，减少 Compaction 频率
 #   - 读多写少：减少值，优化读取性能
 #   - 写多读少：增加值，优化写入性能
-hoodie.compaction.num_commits=10
+compaction.delta_commits=5
 
 # Compaction 并行度（默认 4）
 # 含义：并行执行 Compaction 的 Task 数量
-hoodie.flink.compaction.tasks=4
+compaction.tasks=4
 ```
 
 **调优示例**：
@@ -1204,27 +1278,27 @@ hoodie.flink.compaction.tasks=4
   - 频繁查询
   - 写入不频繁
   配置：
-    hoodie.compaction.async.enabled=true
-    hoodie.compaction.strategy=num_commits
-    hoodie.compaction.num_commits=5
+    compaction.async.enabled=true
+    compaction.trigger.strategy=num_commits
+    compaction.delta_commits=5
   效果：频繁 Compaction，优化读取性能
 
 场景 2：写多读少
   - 频繁写入
   - 查询不频繁
   配置：
-    hoodie.compaction.async.enabled=true
-    hoodie.compaction.strategy=num_commits
-    hoodie.compaction.num_commits=20
+    compaction.async.enabled=true
+    compaction.trigger.strategy=num_commits
+    compaction.delta_commits=20
   效果：减少 Compaction 频率，优化写入性能
 
 场景 3：实时性要求高
   - 需要秒级数据可见性
   - 读写均衡
   配置：
-    hoodie.compaction.async.enabled=true
-    hoodie.compaction.strategy=time_elapsed
-    hoodie.compaction.time_elapsed.minutes=5
+    compaction.async.enabled=true
+    compaction.trigger.strategy=time_elapsed
+    compaction.delta_seconds=300
   效果：定期 Compaction，保证数据新鲜度
 ```
 
@@ -1244,31 +1318,32 @@ hoodie.flink.compaction.tasks=4
 **参数配置**：
 
 ```properties
-# 启用流式索引写入（默认 false）
-# 含义：是否在写入时同时更新索引
+# 索引跨分区全局更新（默认 true）
+# 含义：同一 record key 在不同分区路径写入时，是否更新旧分区的索引映射
 # 调优建议：
-#   - 启用（true）：实时更新索引，查询快
-#   - 禁用（false）：异步更新索引，写入快
-hoodie.index.streaming.write.enabled=true
+#   - 启用（true）：保证全局唯一性，适合数据可能跨分区移动
+#   - 禁用（false）：仅在当前分区维护索引，性能更优
+index.global.enabled=true
 
-# 索引类型（默认 BLOOM）
+# 索引类型（默认 FLINK_STATE）
 # 含义：使用哪种索引
 # 选项：
-#   - BLOOM：布隆过滤器，快速但有误判
+#   - FLINK_STATE：基于 Flink 状态的索引（默认）
 #   - BUCKET：桶索引，精确但需要更多内存
-#   - RECORD_INDEX：记录级索引，最精确
-hoodie.index.type=BUCKET
+#   - RECORD_LEVEL_INDEX / GLOBAL_RECORD_LEVEL_INDEX：记录级索引（基于 Metadata Table）
+#   - BLOOM / GLOBAL_BLOOM / SIMPLE / GLOBAL_SIMPLE / INMEMORY
+index.type=FLINK_STATE
 
-# 一致性哈希桶（默认 false）
-# 含义：是否使用一致性哈希分配 Bucket
-# 调优建议：
-#   - 启用（true）：支持动态扩展
-#   - 禁用（false）：性能更好
+# 桶索引引擎（仅当 index.type=BUCKET 时有效）
+# 含义：桶索引的分配策略
+# 选项：
+#   - SIMPLE：简单哈希分桶
+#   - CONSISTENT_HASHING：一致性哈希（支持动态扩展）
 hoodie.index.bucket.engine=CONSISTENT_HASHING
 
 # 索引并行度（默认 4）
 # 含义：并行构建索引的 Task 数量
-hoodie.index.bootstrap.tasks=4
+index.bootstrap.tasks=4
 ```
 
 **调优示例**：
@@ -1278,28 +1353,27 @@ hoodie.index.bootstrap.tasks=4
   - 频繁更新
   - 需要快速定位记录
   配置：
-    hoodie.index.streaming.write.enabled=true
-    hoodie.index.type=BUCKET
+    index.type=BUCKET
     hoodie.index.bucket.engine=CONSISTENT_HASHING
+    index.bootstrap.tasks=8
   效果：实时索引，快速 Upsert
 
 场景 2：大表场景
   - 表很大（TB 级）
   - 内存有限
   配置：
-    hoodie.index.streaming.write.enabled=false
-    hoodie.index.type=BLOOM
-    hoodie.index.bootstrap.tasks=8
-  效果：异步索引，节省内存
+    index.type=FLINK_STATE
+    index.bootstrap.tasks=8
+  效果：使用 Flink 状态后端，节省内存
 
 场景 3：精确查询
   - 需要精确的记录定位
   - 资源充足
   配置：
-    hoodie.index.streaming.write.enabled=true
-    hoodie.index.type=RECORD_INDEX
-    hoodie.index.bootstrap.tasks=16
-  效果：精确索引，最佳查询性能
+    index.type=RECORD_LEVEL_INDEX
+    index.global.enabled=true
+    index.bootstrap.tasks=16
+  效果：基于 Metadata Table 的精确索引，最佳查询性能
 ```
 
 ### 9.5 Checkpoint 优化

@@ -128,8 +128,8 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `write.batch.size` | 256（MB） | 64-2048 | 批缓冲区大小（MB），越大吞吐越高但延迟越高 |
-| `write.task.max.size` | 1024（MB） | 512-8192 | 单个写入任务最大内存（MB），超过阈值刷出最大 bucket，防止 OOM |
+| `write.batch.size` | 256（MB） | 64-2048 | 批缓冲区大小（MB），越大吞吐越高但延迟越高，见 `FlinkOptions.java:791` |
+| `write.task.max.size` | 1024（MB） | 512-8192 | 单个写入任务最大内存（MB），超过阈值刷出最大 bucket，防止 OOM，见 `FlinkOptions.java:714` |
 
 **调优建议**：
 - 内存充足（16GB+）：`write.batch.size=1024`, `write.task.max.size=4096`
@@ -142,9 +142,10 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 范围 | 说明 |
 |------|--------|------|------|
-| `write.tasks` | 无（取执行环境并行度） | 1-64 | 写入任务数，越多吞吐越高但资源占用越多 |
-| `write.index_bootstrap.tasks` | 无（同 write.tasks） | 1-32 | Bootstrap 任务数，一般为写入任务数的 1/2 |
-| `compaction.tasks` | 无（同 write.tasks） | 1-32 | Compaction 任务数，一般为写入任务数的 1/2 |
+| `write.tasks` | 无（取执行环境并行度） | 1-64 | 写入任务数，越多吞吐越高但资源占用越多，见 `FlinkOptions.java:707` |
+| `write.index_bootstrap.tasks` | 无（同 write.tasks） | 1-32 | Bootstrap 任务数，一般为写入任务数的 1/2，见 `FlinkOptions.java:693` |
+| `compaction.tasks` | 无（同 write.tasks） | 1-32 | Compaction 任务数，一般为写入任务数的 1/2，见 `FlinkOptions.java:929` |
+| `index.write.tasks` | 无（同 write.tasks） | 1-32 | Index Bootstrap 阶段 index write 子任务并行度，见 `FlinkOptions.java:331` |
 
 **调优建议**：
 - 高吞吐：`write.tasks=CPU核数×2`, `bootstrap.tasks=CPU核数`, `compaction.tasks=CPU核数`
@@ -157,10 +158,10 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `compaction.async.enabled` | true | 是否启用异步 Compaction（MOR 表默认开启） |
-| `compaction.trigger.strategy` | num_commits | Compaction 触发策略（num_commits/time_elapsed/num_and_time/num_or_time） |
-| `compaction.delta_commits` | 5 | 多少个 delta commit 后触发 Compaction |
-| `compaction.delta_seconds` | 3600 | 多少秒后触发 Compaction（默认 1 小时） |
+| `compaction.async.enabled` | true | 是否启用异步 Compaction（MOR 表默认开启），见 `FlinkOptions.java:922` |
+| `compaction.trigger.strategy` | num_commits | Compaction 触发策略，取值：`num_commits` / `num_commits_after_last_request` / `time_elapsed` / `num_and_time` / `num_or_time`，见 `FlinkOptions.java:947` |
+| `compaction.delta_commits` | 5 | 多少个 delta commit 后触发 Compaction，见 `FlinkOptions.java:959` |
+| `compaction.delta_seconds` | 3600 | 多少秒后触发 Compaction（默认 1 小时），见 `FlinkOptions.java:966` |
 
 **调优建议**：
 - 生产环境：默认已启用 `compaction.async.enabled=true`
@@ -174,12 +175,12 @@ compaction.delta_commits=20
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `index.type` | FLINK_STATE | 索引类型：FLINK_STATE（默认）/BUCKET/GLOBAL_RECORD_LEVEL_INDEX |
-| `hoodie.index.bucket.engine` | SIMPLE | 桶引擎：SIMPLE/CONSISTENT_HASHING |
+| `index.type` | FLINK_STATE | 索引类型：FLINK_STATE（默认）/ BUCKET / BLOOM / GLOBAL_BLOOM / SIMPLE / GLOBAL_SIMPLE / RECORD_LEVEL_INDEX / GLOBAL_RECORD_LEVEL_INDEX / INMEMORY，见 `FlinkOptions.java:257`，枚举定义 `HoodieIndex.java:161` |
+| `hoodie.index.bucket.engine` | SIMPLE | 桶引擎：SIMPLE / CONSISTENT_HASHING，见 `FlinkOptions.java:598`（Flink 端 key 与 `HoodieIndexConfig.BUCKET_INDEX_ENGINE_TYPE` 对齐） |
 
 **调优建议**：
 - 高并发 Upsert：`index.type=BUCKET`
-- 大表全局唯一场景：`index.type=GLOBAL_RECORD_LEVEL_INDEX`
+- 大表全局唯一场景：`index.type=RECORD_LEVEL_INDEX`
 - 默认场景：`index.type=FLINK_STATE`（利用 Flink 状态后端）
 
 ---

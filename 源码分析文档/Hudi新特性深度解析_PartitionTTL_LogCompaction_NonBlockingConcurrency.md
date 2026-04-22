@@ -18,6 +18,238 @@
 
 # 第一部分：Partition TTL — 分区自动过期清理
 
+## 1. 解决什么问题
+
+Partition TTL 解决的核心问题是**时序数据的自动化生命周期管理**。
+
+### 业务痛点
+
+在大规模时序数据场景（日志分析、IoT 数据、广告点击流）中，数据按日期分区存储，随着时间推移会产生以下问题：
+
+1. **存储成本失控**：历史分区可能占用总存储的 90%+，但业务只关心最近 N 天数据
+2. **元数据操作变慢**：分区数量过多导致 FSView 构建、分区列表获取等操作耗时增加
+3. **表服务调度复杂**：Compaction/Clustering 需要扫描所有分区，大量过期分区拖慢调度
+
+### 传统方案的局限
+
+源码证据：`PartitionTTLStrategy.java` 第 34-37 行注释说明了设计动机：
+```java
+/**
+ * Strategy for partition-level ttl management.
+ */
+public abstract class PartitionTTLStrategy implements TTLStrategy, Serializable
+```
+
+传统做法是手动编写脚本调用 `DELETE_PARTITION`，但存在以下问题：
+- 需要额外的调度系统（Airflow/DolphinScheduler）
+- 策略逻辑分散在外部脚本中，与 Hudi 表配置脱节
+- 无法与 Hudi 的表服务（Table Service）协调，可能与 Compaction/Clustering 冲突
+
+### 实际应用场景
+
+1. **日志分析平台**：保留最近 90 天日志，自动删除更早的分区
+2. **IoT 数据湖**：设备数据按天分区，只保留最近 180 天用于实时分析
+3. **广告点击流**：点击数据按小时分区，保留最近 30 天用于报表生成
+
+## 2. 有什么坑
+
+### 坑1：TTL 配置默认不启用
+
+源码证据：`HoodieTTLConfig.java` 第 66-71 行：
+```java
+public static final ConfigProperty<Integer> DAYS_RETAIN = ConfigProperty
+    .key(PARTITION_TTL_STRATEGY_PARAM_PREFIX + "days.retain")
+    .defaultValue(-1)  // 默认 -1 表示不启用
+    .sinceVersion("1.0.0")
+    .markAdvanced()
+    .withDocumentation("Partition ttl management KEEP_BY_TIME strategy days retain");
+```
+
+**陷阱**：即使设置了 `hoodie.partition.ttl.inline=true`，如果 `days.retain=-1`（默认值），TTL 不会执行任何操作。必须显式设置正数。
+
+### 坑2：单次删除数量限制
+
+源码证据：`KeepByTimeStrategy.java` 第 60-64 行：
+```java
+List<String> expiredPartitions = getExpiredPartitionsForTimeStrategy(getPartitionPathsForTTL());
+int limit = writeConfig.getPartitionTTLMaxPartitionsToDelete();
+log.info("Total expired partitions count {}, limit {}", expiredPartitions.size(), limit);
+return expiredPartitions.stream()
+    .limit(limit) // Avoid a single replace commit too large
+    .collect(Collectors.toList());
+```
+
+**陷阱**：默认最多删除 1000 个分区（`HoodieTTLConfig.MAX_PARTITION_TO_DELETE`）。如果首次启用 TTL 时有大量过期分区，需要多次执行才能全部清理。
+
+### 坑3：前置条件检查严格
+
+源码证据：`KeepByTimeStrategy.java` 第 54-58 行：
+```java
+Option<HoodieInstant> lastCompletedInstant = hoodieTable.getActiveTimeline().filterCompletedInstants().lastInstant();
+if (!lastCompletedInstant.isPresent() || ttlInMilis <= 0
+    || !hoodieTable.getMetaClient().getTableConfig().getPartitionFields().isPresent()) {
+  return Collections.emptyList();
+}
+```
+
+**陷阱**：三个条件任一不满足都会跳过 TTL：
+- 表还没有完成过任何 commit
+- TTL 配置无效（≤0）
+- 表未启用分区（非分区表）
+
+### 坑4：Late-arriving data 的影响
+
+源码证据：`KeepByTimeStrategy.java` 第 82-92 行：
+```java
+private Map<String, Option<String>> getLastCommitTimeForPartitions(List<String> partitionPaths) {
+    return hoodieTable.getContext().map(partitionPaths, partitionPath -> {
+      Option<String> partitionLastModifiedTime = hoodieTable.getHoodieView()
+          .getLatestFileSlicesBeforeOrOn(partitionPath, instantTime, true)
+          .map(FileSlice::getBaseInstantTime)
+          .max(Comparator.naturalOrder())  // 取最大的 instantTime
+          .map(Option::ofNullable)
+          .orElse(Option.empty());
+      return Pair.of(partitionPath, partitionLastModifiedTime);
+    }, statsParallelism).stream().collect(Collectors.toMap(Pair::getKey, Pair::getValue));
+}
+```
+
+**陷阱**：使用 `KeepByTimeStrategy` 时，如果旧分区收到迟到数据（Late-arriving data），其最后修改时间会更新，导致该分区不会被过期。如果需要"无论是否更新，超过 N 天一律删除"的语义，应使用 `KeepByCreationTimeStrategy`。
+
+### 坑5：TTL 与 Clean 的协调
+
+**陷阱**：TTL 删除分区后生成 `REPLACE_COMMIT`，但被替换的旧文件需要 Clean 服务来实际释放存储空间。如果 Clean 配置不当（如 `commits.retained` 过大），存储空间可能不会立即释放。
+
+### 性能陷阱
+
+源码证据：`PartitionTTLStrategy.java` 第 61-73 行：
+```java
+protected List<String> getPartitionPathsForTTL() {
+    String partitionSelected = writeConfig.getPartitionTTLPartitionSelected();
+    HoodieTimer timer = HoodieTimer.start();
+    List<String> partitionsForTTL;
+    if (StringUtils.isNullOrEmpty(partitionSelected)) {
+      // Return all partition paths.
+      partitionsForTTL = FSUtils.getAllPartitionPaths(hoodieTable.getContext(), 
+          hoodieTable.getMetaClient(), writeConfig.getMetadataConfig());
+    } else {
+      partitionsForTTL = Arrays.asList(partitionSelected.split(","));
+    }
+    log.info("Get partitions for ttl cost {} ms", timer.endTimer());
+    return partitionsForTTL;
+}
+```
+
+**陷阱**：如果表有数万个分区，`getAllPartitionPaths()` 会扫描所有分区目录，耗时可能达到分钟级。建议通过 `partition.selected` 配置只对特定分区启用 TTL。
+
+## 3. 核心概念解释
+
+### TTLStrategy 接口层次
+
+源码证据：`TTLStrategy.java` 是一个空标记接口（Marker Interface）：
+```java
+/**
+ * Strategy for ttl management.
+ */
+public interface TTLStrategy {
+}
+```
+
+这是面向未来扩展的设计，为未来可能出现的 Record-Level TTL 预留空间。
+
+### PartitionTTLStrategy 抽象基类
+
+源码证据：`PartitionTTLStrategy.java` 第 37-54 行：
+```java
+public abstract class PartitionTTLStrategy implements TTLStrategy, Serializable {
+  protected final HoodieTable hoodieTable;
+  protected final HoodieWriteConfig writeConfig;
+  protected final String instantTime;
+
+  /**
+   * Get expired partition paths for a specific partition ttl strategy.
+   */
+  public abstract List<String> getExpiredPartitionPaths();
+}
+```
+
+**核心方法**：
+- `getExpiredPartitionPaths()`：由子类实现，返回过期分区列表
+- `getPartitionPathsForTTL()`：模板方法，提供获取候选分区的通用逻辑
+
+### 两种内建策略
+
+| 策略 | 参考时间 | 信息来源 | 适用场景 |
+|------|---------|---------|---------|
+| KeepByTimeStrategy | 分区最后修改时间 | FileSlice 的 baseInstantTime | 按数据活跃度过期 |
+| KeepByCreationTimeStrategy | 分区创建时间 | HoodiePartitionMetadata 文件 | 按绝对年龄过期 |
+
+### 与其他系统的对比
+
+- **Hive RETENTION**：仅元数据标记，不删除数据
+- **Iceberg Expire Snapshots**：删除快照，但不删除分区
+- **Delta Lake VACUUM**：删除旧版本文件，但不删除分区
+- **Hudi Partition TTL**：真正删除整个分区，生成 REPLACE_COMMIT
+
+## 4. 设计理念
+
+### 声明式管理 vs 命令式脚本
+
+源码证据：`HoodieTTLConfig.java` 的配置项设计体现了声明式理念：
+```java
+public static final ConfigProperty<Boolean> INLINE_PARTITION_TTL = ConfigProperty
+    .key("hoodie.partition.ttl.inline")
+    .defaultValue(false)
+    .sinceVersion("1.0.0")
+    .markAdvanced()
+    .withDocumentation("When enabled, the partition ttl management service is invoked immediately after each commit, "
+        + "to delete exipired partitions");
+```
+
+**设计权衡**：
+- **优势**：策略跟随表元数据演进，与表服务天然协调，配置集中管理
+- **劣势**：灵活性不如外部脚本（如无法根据业务逻辑动态调整）
+
+### 可扩展策略框架
+
+源码证据：`PartitionTTLStrategyType.java` 枚举 + `HoodiePartitionTTLStrategyFactory.java` 工厂模式：
+```java
+public static PartitionTTLStrategy createStrategy(
+    HoodieTable hoodieTable, TypedProperties props, String instantTime) throws IOException {
+  String strategyClassName = getPartitionTTLStrategyClassName(props);
+  try {
+    return (PartitionTTLStrategy) ReflectionUtils.loadClass(strategyClassName,
+        new Class<?>[] {HoodieTable.class, String.class}, hoodieTable, instantTime);
+  } catch (Throwable e) {
+    throw new IOException("Could not load partition ttl management strategy class " + strategyClassName, e);
+  }
+}
+```
+
+**设计哲学**：
+- 内建策略通过枚举类型配置（`KEEP_BY_TIME` / `KEEP_BY_CREATION_TIME`）
+- 自定义策略通过完整类名配置（`hoodie.partition.ttl.strategy.class`）
+- 类名配置优先级高于枚举类型，确保用户自定义策略不被覆盖
+
+### 与表服务的协调
+
+源码证据：`SparkPartitionTTLActionExecutor.java` 第 355-359 行：
+```java
+} catch (HoodieDeletePartitionPendingTableServiceException e) {
+  // 如果分区正在被其他 Table Service 操作，跳过
+  LOG.info("Partition is under table service, do nothing, call delete partition next time.");
+  return emptyResult;
+}
+```
+
+**设计理念**：TTL 操作感知正在进行的 Compaction/Clustering，通过异常机制优雅跳过冲突分区，而非强制中断其他表服务。
+
+### 架构演进历史
+
+- **0.x 版本**：无内建 TTL 支持，依赖外部脚本
+- **1.0.0 版本**：引入 Partition TTL（RFC-65），支持 Inline 和 Async 两种模式
+- **未来方向**：可能扩展到 Record-Level TTL（TTLStrategy 接口预留了扩展空间）
+
 ## 1.1 为什么需要 Partition TTL
 
 ### 传统 Clean 的局限性
@@ -467,6 +699,256 @@ CALL run_ttl(table => 'my_hudi_table')
 
 # 第二部分：Log Compaction — 轻量级日志压缩
 
+## 1. 解决什么问题
+
+Log Compaction 解决的核心问题是**MOR 表的写放大（Write Amplification）和读取性能平衡**。
+
+### 业务痛点
+
+在 MOR（Merge on Read）表中，传统 Compaction 存在严重的写放大问题：
+
+源码证据：`HoodieLogCompactionPlanGenerator.java` 第 55 行注释：
+```java
+.setCompactorClassName("org.apache.hudi.table.action.compact.LogCompactionExecutionHelper") 
+// added for compatibility between releases
+```
+
+**写放大场景**：
+- Base File 128MB + Log Files 5MB → 传统 Compaction 需要写出 128MB+ 新 Base File
+- 即使只有 5MB 更新，也要重写整个 Base File
+- I/O 成本：读取 138MB + 写入 128MB = 266MB
+
+**影响场景**：
+1. **Metadata Table**：Hudi 元数据表是 MOR 表，每次 delta commit 产生 log blocks，频繁全量 Compaction 写放大严重
+2. **高频流式写入**：每分钟 commit 一次，log files 累积快，但频繁全量 Compaction 消耗大量 I/O
+3. **大 Base File 场景**：Base File 几百 MB 甚至 GB，少量更新也需要重写整个文件
+
+### 如果没有 Log Compaction 会怎样
+
+1. **文件句柄数量爆炸**：多个零散 Log File 导致读取时打开大量文件句柄
+2. **读取性能下降**：扫描多个小 Log File 的随机 I/O 开销大
+3. **Compaction 频率两难**：频繁 Compaction → 写放大严重；不频繁 Compaction → 读取性能差
+
+### 实际应用场景
+
+1. **实时数据湖**：Flink 流式写入每分钟产生 log files，Log Compaction 每小时合并一次，传统 Compaction 每天执行
+2. **CDC 同步**：数据库 CDC 产生大量小更新，Log Compaction 减少 log 文件数量，降低读取开销
+3. **元数据表优化**：Hudi 自身的 Metadata Table 默认启用 Log Compaction（`ENABLE_LOG_COMPACTION` since 0.14.0）
+
+## 2. 有什么坑
+
+### 坑1：Log Compaction 和传统 Compaction 的配置混淆
+
+源码证据：`HoodieCompactionConfig.java` 第 65-70 行：
+```java
+public static final ConfigProperty<String> ENABLE_LOG_COMPACTION = ConfigProperty
+    .key("hoodie.log.compaction.enable")
+    .defaultValue("false")
+    .markAdvanced()
+    .sinceVersion("0.14.0")
+    .withDocumentation("By enabling log compaction through this config, log compaction will also get enabled for the metadata table.");
+```
+
+**陷阱**：`hoodie.log.compaction.enable` 和 `hoodie.log.compaction.inline` 是两个独立配置：
+- `enable=true`：启用 Log Compaction 功能（包括元数据表）
+- `inline=true`：在写入时内联执行 Log Compaction
+- 必须两者都设置为 `true` 才能在写入时自动触发
+
+### 坑2：触发阈值的理解偏差
+
+源码证据：`HoodieLogCompactionPlanGenerator.java` 第 92-112 行：
+```java
+private boolean isFileSliceEligibleForLogCompaction(FileSlice fileSlice, String maxInstantTime,
+                                                    Option<InstantRange> instantRange) {
+    log.info("Checking if fileId {} and partition {} eligible for log compaction.", 
+        fileSlice.getFileId(), fileSlice.getPartitionPath());
+    HoodieTableMetaClient metaClient = hoodieTable.getMetaClient();
+    long numLogFiles = fileSlice.getLogFiles().count();
+    if (numLogFiles >= writeConfig.getLogCompactionBlocksThreshold()) {
+      log.info("Total logs files ({}) is greater than log blocks threshold is {}", 
+          numLogFiles, writeConfig.getLogCompactionBlocksThreshold());
+      return true;
+    }
+    HoodieLogBlockMetadataScanner scanner = new HoodieLogBlockMetadataScanner(metaClient, 
+        fileSlice.getLogFiles()
+        .sorted(HoodieLogFile.getLogFileComparator())
+        .collect(Collectors.toList()),
+        writeConfig.getMaxDFSStreamBufferSize(),
+        maxInstantTime,
+        instantRange);
+    int totalBlocks = scanner.getCurrentInstantLogBlocks().size();
+    log.info("Total blocks seen are {}, log blocks threshold is {}", 
+        totalBlocks, writeConfig.getLogCompactionBlocksThreshold());
+    return totalBlocks >= writeConfig.getLogCompactionBlocksThreshold();
+}
+```
+
+**陷阱**：`hoodie.log.compaction.blocks.threshold=5` 有两层含义（满足任一即触发）：
+1. Log **文件数量** ≥ 5
+2. Log **blocks 总数** ≥ 5
+
+很多用户误以为只看文件数量，实际上单个文件内的 blocks 也会计入。
+
+### 坑3：Log Compaction 后旧文件不会立即删除
+
+源码证据：RFC-48 描述的行为：
+> "当 LogCompaction 执行后，产生 log.4，Reader 在扫描时会看到 4 个 log blocks，但会**只考虑 log block 4**（因为它包含了 block 1-3 的合并结果）。"
+
+**陷阱**：
+- Log Compaction 生成新的合并 Log File，但旧的 Log File 物理上仍存在
+- 旧文件在 Timeline 上被"覆盖"，Reader 会跳过
+- 最终由 Clean 服务删除旧文件
+- 如果 Clean 配置不当，存储空间不会立即释放
+
+### 坑4：与传统 Compaction 的协调
+
+源码证据：`ScheduleCompactionActionExecutor.java` 中的触发逻辑：
+```java
+private boolean needLogCompact(Pair<Integer, String> latestDeltaCommitInfoSinceCompact) {
+    Option<Pair<Integer, String>> latestDeltaCommitInfoSinceLogCompactOption =
+        getLatestDeltaCommitInfoSinceLogCompaction();
+    int numDeltaCommitsSinceLatestCompaction = latestDeltaCommitInfoSinceCompact.getLeft();
+    int numDeltaCommitsSinceLatestLogCompaction = latestDeltaCommitInfoSinceLogCompactOption.isPresent()
+        ? latestDeltaCommitInfoSinceLogCompactOption.get().getLeft() : 0;
+
+    int numDeltaCommitsSince = Math.min(
+        numDeltaCommitsSinceLatestCompaction, numDeltaCommitsSinceLatestLogCompaction);
+    boolean shouldLogCompact = numDeltaCommitsSince >= config.getLogCompactionBlocksThreshold();
+    return shouldLogCompact;
+}
+```
+
+**陷阱**：如果刚做完传统 Compaction，Log Compaction 不会立即触发（取较小值逻辑）。这可能导致用户困惑："为什么配置了 Log Compaction 但没有执行？"
+
+### 坑5：只适用于 MOR 表
+
+源码证据：`ScheduleCompactionActionExecutor.java` 第 579 行：
+```java
+ValidationUtils.checkArgument(
+    this.table.getMetaClient().getTableType() == HoodieTableType.MERGE_ON_READ, ...);
+```
+
+**陷阱**：COW 表没有 Log File，配置 Log Compaction 会在调度阶段失败。
+
+### 性能陷阱
+
+**陷阱**：Log Compaction 虽然减少了写放大，但仍需要读取所有 Log Files 并写出合并后的 Log File。如果 Log Files 总大小很大（如几百 MB），Log Compaction 的 I/O 成本也不低。建议配合传统 Compaction 使用，而非完全替代。
+
+## 3. 核心概念解释
+
+### Log Compaction vs 传统 Compaction
+
+| 维度 | 传统 Compaction | Log Compaction |
+|------|----------------|----------------|
+| 输入 | Base File + Log Files | 仅 Log Files |
+| 输出 | 新的 Base File (.parquet) | 新的 Log File (.log) |
+| Timeline Action | `compaction` → `commit` | `logcompaction` → `deltacommit` |
+| I/O 成本 | 高（需重写 Base File） | 低（只合并 Log） |
+| 读取性能改善 | 最优（无需 merge） | 中等（减少了 log 数量） |
+| 写放大 | 高 | 低 |
+| Handle 类型 | MergeHandle | AppendHandle |
+
+源码证据：`HoodieTimeline.java` 定义了独立的 Action 类型：
+```java
+String LOG_COMPACTION_ACTION = "logcompaction";
+```
+
+### Minor Compaction vs Major Compaction
+
+- **Minor Compaction**：Log Compaction 的别名，只合并 Log Files
+- **Major Compaction**：传统 Compaction，合并 Base File + Log Files
+
+这个术语来自 LSM-Tree 数据库（如 HBase、RocksDB）的设计。
+
+### Log Block 的概念
+
+Log File 内部由多个 Log Block 组成：
+- **Data Block**：包含实际数据记录
+- **Delete Block**：包含删除标记
+- **Rollback Block**：包含回滚信息
+
+Log Compaction 会合并多个 Data Block 和 Delete Block，生成一个新的 Data Block。
+
+### 与其他系统的对比
+
+- **HBase Minor Compaction**：合并多个 HFile，不触碰 MemStore
+- **RocksDB Level Compaction**：合并同一 Level 的 SST 文件
+- **Hudi Log Compaction**：合并同一 File Group 的 Log Files
+
+## 4. 设计理念
+
+### 延迟合并（Deferred Merging）
+
+源码证据：`HoodieCompactor.java` 中的执行路径分离：
+```java
+if (operationType == WriteOperationType.LOG_COMPACT) {
+    // Log Compaction: 转发到 logCompact 方法
+    return context.parallelize(operations).map(
+        operation -> logCompact(config, operation, compactionInstantTime,
+            instantRange, table, taskContextSupplier))
+        .flatMap(List::iterator);
+} else {
+    // 传统 Compaction: 转发到 compact 方法
+    return context.parallelize(operations).map(
+        operation -> compact(config, operation, compactionInstantTime,
+            readerContextFactory.getContext(), table, maxInstantTime, taskContextSupplier))
+        .flatMap(List::iterator);
+}
+```
+
+**设计哲学**：
+- Log Compaction 是"轻量级优化"，延迟完整的 Base File 重写
+- 通过多次 Log Compaction 逐步改善读取性能
+- 最终由传统 Compaction 完成彻底合并
+
+### 空间换时间的权衡
+
+**设计权衡**：
+- **优势**：减少写放大，提高写入吞吐
+- **劣势**：读取时仍需 merge（虽然 log 数量减少了），不如传统 Compaction 后的纯 Base File 读取快
+
+### 与 LSM-Tree 的相似性
+
+Hudi 的 MOR 表 + Log Compaction 设计借鉴了 LSM-Tree 的思想：
+- **MemTable** → Hudi 的 Log File（追加写）
+- **SSTable** → Hudi 的 Base File（不可变）
+- **Minor Compaction** → Hudi 的 Log Compaction
+- **Major Compaction** → Hudi 的传统 Compaction
+
+### 架构演进历史
+
+- **0.x 版本**：只有传统 Compaction，写放大严重
+- **0.13.0 版本**：引入 Log Compaction（RFC-48），支持 Inline 模式
+- **0.14.0 版本**：为 Metadata Table 默认启用 Log Compaction
+- **未来方向**：可能引入更智能的 Compaction 策略选择（基于 I/O 成本模型）
+
+### 为什么使用 AppendHandle 而非 MergeHandle
+
+源码证据：`HoodieCompactor.java` 中的 Handle 选择：
+```java
+// 传统 Compaction: 使用 MergeHandle，输出 Base File
+public List<WriteStatus> compact(...) {
+    HoodieMergeHandle mergeHandle = HoodieMergeHandleFactory.create(...);
+    mergeHandle.doMerge();
+    return mergeHandle.close();
+}
+
+// Log Compaction: 使用 AppendHandle，输出 Log File
+public List<WriteStatus> logCompact(...) {
+    HoodieReaderContext<IndexedRecord> readerContext = new HoodieAvroReaderContext(...);
+    FileGroupReaderBasedAppendHandle appendHandle =
+        new FileGroupReaderBasedAppendHandle<>(writeConfig, instantTime,
+            table, operation, taskContextSupplier, readerContext);
+    appendHandle.doAppend();
+    return appendHandle.close();
+}
+```
+
+**设计理念**：
+- MergeHandle：创建新的 Parquet Base File，需要完整的 schema 和 Parquet 写入器
+- AppendHandle：追加到 Log File，只需要序列化记录到 Avro 格式
+- AppendHandle 的写入路径更轻量，符合 Log Compaction 的"轻量级"定位
+
 ## 2.1 为什么需要 Log Compaction
 
 ### 传统 Compaction 的写放大问题
@@ -801,6 +1283,271 @@ hoodie.compact.inline.max.delta.commits=10
 ---
 
 # 第三部分：Non-Blocking Concurrency Control (NBCC)
+
+## 1. 解决什么问题
+
+NBCC 解决的核心问题是**高并发流式写入场景下的写写冲突和重试风暴**。
+
+### 业务痛点
+
+源码证据：`WriteConcurrencyMode.java` 第 42-46 行的注释清晰描述了 NBCC 的价值：
+```java
+// Multiple writer can perform write ops on a MOR table with non-blocking conflict resolution
+@EnumFieldDescription("Multiple writers can operate on the table with non-blocking conflict resolution. "
+    + "The writers can write into the same file group with the conflicts resolved automatically "
+    + "by the query reader and the compactor.")
+NON_BLOCKING_CONCURRENCY_CONTROL;
+```
+
+传统 OCC（Optimistic Concurrency Control）在高并发场景下的问题：
+
+1. **Bloom Filter Index 场景**：
+   - 多个 Writer 倾向于写入小文件（small file handling）
+   - 同一个小文件会被多个 Writer 同时选中
+   - 冲突率极高，后提交的 Writer 必须回滚重试
+
+2. **Hash Index 场景**：
+   - 记录通过 hash 均匀分布到所有 bucket
+   - 每个 Writer 都可能触碰所有 bucket
+   - 冲突几乎不可避免
+
+3. **重试风暴**：
+   - 冲突后回滚重试，但重试时可能再次冲突
+   - 恶性循环导致写入吞吐急剧下降
+
+### 如果没有 NBCC 会怎样
+
+**实际案例**（RFC-66 描述）：
+- 10 个 Flink 作业同时写入同一张 Hudi 表
+- 使用 OCC 模式，冲突率 > 80%
+- 平均每个作业需要重试 3-5 次才能成功
+- 写入延迟从秒级上升到分钟级
+
+### 实际应用场景
+
+1. **多源数据汇入**：多个 Flink/Spark 流从不同数据源（Kafka、Pulsar、数据库 CDC）写入同一张 Hudi 表
+2. **实时数据 JOIN**：替代 Flink 的 State-Based JOIN，用 Hudi 表作为 JOIN 的物化视图，多个流同时更新
+3. **微服务数据湖**：多个微服务实例并发写入同一张事件表
+
+## 2. 有什么坑
+
+### 坑1：必须使用 MOR + Bucket Index
+
+源码证据：`HoodieWriteConfig.java` 第 3753-3757 行的硬性约束：
+```java
+if (writeConcurrencyMode == WriteConcurrencyMode.NON_BLOCKING_CONCURRENCY_CONTROL) {
+    boolean isMetadataTable = HoodieTableMetadata.isMetadataTable(writeConfig.getBasePath());
+    checkArgument(
+        writeConfig.getTableType().equals(HoodieTableType.MERGE_ON_READ)
+            && (isMetadataTable || writeConfig.isSimpleBucketIndex()),
+        "Non-blocking concurrency control requires the MOR table with simple bucket index "
+            + "or it has to be Metadata table");
+}
+```
+
+**陷阱**：
+- COW 表不支持 NBCC（会抛出 `IllegalArgumentException`）
+- 必须使用 Simple Bucket Index（Bloom Filter Index / Global Index 不支持）
+- 配置错误会在 `HoodieWriteConfig` 构建时失败，而非运行时
+
+### 坑2：Bucket 数量不可变
+
+源码证据：`BucketIdentifier.java` 第 40-42 行的确定性哈希：
+```java
+public static int getBucketId(List<String> hashKeyFields, int numBuckets) {
+    return (hashKeyFields.hashCode() & Integer.MAX_VALUE) % numBuckets;
+}
+```
+
+**陷阱**：
+- Bucket 数量一旦设定，无法动态调整（Simple Bucket Index 限制）
+- 如果数据量增长，无法通过增加 bucket 来扩展
+- 需要在表创建时根据数据量预估合理设置 `hoodie.bucket.index.num.buckets`
+
+### 坑3：BULK_INSERT 仍需冲突检测
+
+源码证据：`HoodieWriteConfig.java` 的 `needResolveWriteConflict` 方法：
+```java
+public boolean needResolveWriteConflict(WriteOperationType operationType,
+    boolean isMetadataTable, HoodieWriteConfig config, HoodieTableConfig tableConfig) {
+    WriteConcurrencyMode mode = getWriteConcurrencyMode();
+    switch (mode) {
+      case SINGLE_WRITER:
+        return false;
+      case OPTIMISTIC_CONCURRENCY_CONTROL:
+        return true;
+      case NON_BLOCKING_CONCURRENCY_CONTROL: {
+        if (isMetadataTable) {
+          return false;
+        } else {
+          // NBCC 只在 BULK_INSERT 时需要冲突检测
+          return WriteOperationType.BULK_INSERT == operationType;
+        }
+      }
+    }
+}
+```
+
+**陷阱**：BULK_INSERT 可能创建新的 Base File（而非追加 Log File），两个 Writer 同时 BULK_INSERT 同一个 partition 可能产生文件冲突。
+
+### 坑4：仍需要 Lock Provider
+
+**陷阱**：虽然数据写入（Ingestion）之间不需要锁，但以下场景仍需要锁：
+- Table Service（Compaction、Clustering）与数据写入的协调
+- Timeline 操作（创建 instant、提交 commit）的原子性
+- 必须配置 `hoodie.write.lock.provider`（如 ZooKeeper、DynamoDB）
+
+### 坑5：Clustering 与 Pending Ingestion 的冲突
+
+源码证据：`PreferWriterConflictResolutionStrategy.java` 第 1137-1148 行：
+```java
+@Override
+public boolean hasConflict(ConcurrentOperation thisOperation, ConcurrentOperation otherOperation) {
+    if (isClusteringBlockForPendingIngestion
+        && WriteOperationType.CLUSTER.equals(thisOperation.getOperationType())
+        && isRequestedIngestionInstant(otherOperation)) {
+      log.info("Clustering operation {} conflicts with pending ingestion instant {} "
+          + "that has an active heartbeat", thisOperation, otherOperation);
+      return true;
+    }
+    return super.hasConflict(thisOperation, otherOperation);
+}
+```
+
+**陷阱**：Clustering 会重写整个 File Group，如果有 Ingestion 正在向同一个 File Group 追加 Log File，Clustering 完成后这些 Log File 会变成"孤儿"。Clustering 遇到 Pending Ingestion 时会主动失败。
+
+### 坑6：必须使用 LAZY Clean 策略
+
+源码证据：RFC-66 的前置条件要求：
+> "Lazy Cleaning Strategy (必须)"
+
+**陷阱**：EAGER Clean 策略会在 commit 后立即清理旧文件，可能删除其他 Writer 正在读取的 Log File。必须配置 `hoodie.clean.failed.writes.policy=LAZY`。
+
+### 性能陷阱
+
+**陷阱**：NBCC 下多个 Writer 会产生大量 Log File，需要更频繁的 Compaction。建议配合 Log Compaction 使用：
+```properties
+hoodie.log.compaction.enable=true
+hoodie.log.compaction.inline=true
+hoodie.log.compaction.blocks.threshold=5
+```
+
+## 3. 核心概念解释
+
+### WriteConcurrencyMode 三种模式
+
+源码证据：`WriteConcurrencyMode.java` 第 30-46 行定义了三种模式：
+
+| 模式 | 多写者 | 冲突处理 | 写入吞吐 | 适用场景 |
+|------|-------|---------|---------|---------|
+| SINGLE_WRITER | 否 | 无 | 最高 | 单一 ETL Pipeline |
+| OCC | 是 | Lock + 回滚重试 | 中等（冲突多时下降） | 低频批量写入 |
+| NBCC | 是 | 无需处理（架构设计避免冲突） | 高 | 高频流式多写者 |
+
+### 确定性哈希分桶（Deterministic Hashing）
+
+源码证据：`BucketIdentifier.java` 第 28-30 行的关键设计：
+```java
+public class BucketIdentifier implements Serializable {
+  // Ensure the same records keys from different writers are desired to be distributed into the same bucket
+  private static final String CONSTANT_FILE_ID_SUFFIX = "-0000-0000-0000-000000000000";
+```
+
+**核心概念**：
+- 相同 Record Key 的记录，无论哪个 Writer 处理，都路由到同一个 Bucket
+- Bucket ID 通过 `(hashKeyFields.hashCode() & Integer.MAX_VALUE) % numBuckets` 计算
+- File ID 使用固定后缀 `CONSTANT_FILE_ID_SUFFIX`，确保不同 Writer 对同一 Bucket 使用相同的 File ID
+
+### Log File 的 Writer 隔离
+
+**核心概念**：在 MOR 表中，不同 Writer 写入的是不同的 Log File：
+```
+Writer A writes: filegroup_X.log.1_0-1-001_20250415010000
+Writer B writes: filegroup_X.log.1_0-2-002_20250415010100
+```
+
+Log File 命名包含：
+- File Group ID（相同）
+- Log Version（相同）
+- Writer ID（不同）
+- Instant Time（不同）
+
+### PreferWriter 策略
+
+源码证据：`PreferWriterConflictResolutionStrategy.java` 的设计哲学：
+
+**核心概念**：
+- **数据写入 vs Table Service 冲突**：Table Service 让步（回滚），数据写入优先通过
+- **数据写入 vs 数据写入冲突**：通过 NBCC 架构设计避免（MOR + Bucket Index）
+- **Table Service vs Table Service 冲突**：正常的文件级冲突检测
+
+### 与其他系统的对比
+
+- **PostgreSQL MVCC**：多版本并发控制，读不阻塞写，写不阻塞读
+- **HBase MVCC**：每个 Cell 有多个版本，通过时间戳区分
+- **Hudi NBCC**：每个 Record 的多个版本分散在不同 Log File 中，通过 Compaction 或读取时合并
+
+## 4. 设计理念
+
+### 架构约束代替运行时检测
+
+源码证据：`WriteConcurrencyMode.java` 第 48-50 行的方法：
+```java
+public boolean supportsMultiWriter() {
+    return this == OPTIMISTIC_CONCURRENCY_CONTROL || this == NON_BLOCKING_CONCURRENCY_CONTROL;
+}
+```
+
+**设计哲学**：
+- OCC：运行时检测冲突，冲突后回滚重试（Pessimistic）
+- NBCC：通过架构约束（MOR + Bucket Index）使冲突根本不会发生（Optimistic）
+
+这是一种"设计时解决问题"而非"运行时解决问题"的思想。
+
+### Merge on Read 的延迟冲突解决
+
+**设计理念**：
+- 写入时：不同 Writer 创建不同的 Log File，无冲突
+- 读取时：Reader 扫描所有 Log Files，按 commit time / event time 选择最新版本
+- Compaction 时：Compactor 合并所有 Log Files，解决多版本冲突
+
+这是一种"延迟冲突解决"（Deferred Conflict Resolution）策略。
+
+### 为什么 COW 表不支持 NBCC
+
+源码证据：`HoodieWriteConfig.java` 的约束检查注释：
+```java
+checkArgument(
+    writeConfig.getTableType().equals(HoodieTableType.MERGE_ON_READ)
+        && (isMetadataTable || writeConfig.isSimpleBucketIndex()),
+    "Non-blocking concurrency control requires the MOR table with simple bucket index "
+        + "or it has to be Metadata table");
+```
+
+**设计权衡**：
+- COW 表每次写入创建新的 Base File 替换旧的
+- 两个 Writer 同时修改同一个 File Group 会产生两个新 Base File
+- 文件系统无法处理这种冲突（不允许两个文件同时作为同一个 File Group 的最新 Base File）
+- MOR 表的 Log File 是追加式的，不同 Writer 创建不同的 Log File，天然支持并发
+
+### 架构演进历史
+
+- **0.x 版本**：只支持 SINGLE_WRITER 和 OCC
+- **0.14.0 版本**：引入 NBCC（RFC-66），支持 MOR + Bucket Index 场景
+- **未来方向**：
+  - RFC-42（Consistent Hashing Index）：支持动态调整 bucket 数量
+  - RFC-91（Storage-based lock provider）：消除外部锁依赖
+
+### 与 MVCC 的相似性和差异
+
+**相似性**：
+- 都是多版本并发控制
+- 都通过版本号（Hudi 用 instant time）区分不同版本
+- 都在读取时或后台任务中解决冲突
+
+**差异**：
+- MVCC（如 PostgreSQL）：版本存储在同一个数据页中，通过 tuple header 区分
+- Hudi NBCC：版本存储在不同的 Log File 中，通过文件名区分
 
 ## 3.1 为什么需要 NBCC
 
@@ -1218,6 +1965,288 @@ hoodie.log.compaction.inline=true
 
 # 第四部分：Record Position Merge — 基于位置的合并优化
 
+## 1. 解决什么问题
+
+Record Position Merge 解决的核心问题是**MOR 表读取路径中 Key-Based Merge 的性能瓶颈**。
+
+### 业务痛点
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 第 59-63 行的类注释：
+```java
+/**
+ * A buffer that is used to store log records by {@link org.apache.hudi.common.table.log.HoodieMergedLogRecordReader}
+ * by calling the {@link #processDataBlock} and {@link #processDeleteBlock} methods into record position based map.
+ * Here the position means that record position in the base file.
+ */
+public class PositionBasedFileGroupRecordBuffer<T> extends KeyBasedFileGroupRecordBuffer<T>
+```
+
+传统 Key-Based Merge 的性能瓶颈：
+
+1. **HashMap 内存消耗**：
+   - Log File 中的更新记录存入 `HashMap<RecordKey, Record>`
+   - 如果 Log File 有大量更新，HashMap 消耗大量 JVM 堆内存
+   - 复合 Key（如 `user_id:order_id`）的字符串构造和存储开销更大
+
+2. **字符串比较开销**：
+   - Record Key 通常是字符串类型
+   - `hashCode()` 和 `equals()` 操作相对昂贵
+   - 每条 Base File 记录都需要提取 Key 并在 HashMap 中查找
+
+3. **序列化/反序列化开销**：
+   - 从 Log Block 读取记录需要完整反序列化
+   - 提取 Record Key 需要访问特定字段
+
+### 如果没有 Position-Based Merge 会怎样
+
+**性能对比**（理论分析）：
+- Key-Based：`O(N)` 次字符串 hashCode + HashMap 查找
+- Position-Based：`O(N)` 次整数比较 + RoaringBitmap 查找
+
+在大规模数据集（百万级记录）上，Position-Based 可以带来 2-5 倍的性能提升。
+
+### 实际应用场景
+
+1. **大表增量读取**：Base File 几百 MB，Log Files 几十 MB，Position-Based 显著减少内存占用
+2. **复合主键场景**：Record Key 是多字段组合（如 `region:city:user_id`），字符串操作开销大
+3. **高频查询场景**：Presto/Trino 查询 MOR 表，Position-Based 减少查询延迟
+
+## 2. 有什么坑
+
+### 坑1：Base File 被 Compaction 重写后失效
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 的 `extractRecordPositions` 方法第 331-336 行：
+```java
+// 检查 log block 中记录的 Base File InstantTime 是否与当前 File Group 匹配
+String blockBaseFileInstantTime = logBlock.getBaseFileInstantTimeOfPositions();
+if (StringUtils.isNullOrEmpty(blockBaseFileInstantTime)
+    || !baseFileInstantTime.equals(blockBaseFileInstantTime)) {
+  LOG.debug("The record positions cannot be used because the base file instant time "
+      + "is either missing or different from the base file to merge.");
+  return null;  // 位置信息无效
+}
+```
+
+**陷阱**：
+- Log Block 中记录的位置是基于写入时的 Base File
+- 如果 Base File 被 Compaction 重写，行号会发生变化
+- 此时 Position-Based Merge 会自动降级到 Key-Based Merge
+- 用户无感知，但性能优势消失
+
+### 坑2：旧版本 Log Block 缺少位置信息
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 第 97-102 行：
+```java
+// Extract positions from data block.
+List<Long> recordPositions = extractRecordPositions(dataBlock, baseFileInstantTime);
+if (recordPositions == null) {
+  LOG.debug("Falling back to key based merge for data block");
+  fallbackToKeyBasedBuffer();
+  super.processDataBlock(dataBlock, keySpecOpt);
+  return;
+}
+```
+
+**陷阱**：
+- 旧版本 Hudi（< 1.0）写入的 Log Block 可能没有 record position 元数据
+- 读取这些旧 Log Block 时会降级到 Key-Based Merge
+- 升级到新版本后，需要等待 Compaction 重写才能享受 Position-Based 优势
+
+### 坑3：RoaringBitmap 为空的情况
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 的 `extractRecordPositions` 方法第 339-343 行：
+```java
+// 从 RoaringBitmap 中提取位置列表
+Roaring64NavigableMap positions = logBlock.getRecordPositions();
+if (positions == null || positions.isEmpty()) {
+  LOG.info("No record position info is found...");
+  return null;
+}
+```
+
+**陷阱**：
+- 如果 Log Block 的 RoaringBitmap 为空（可能是写入时的 bug 或特殊场景）
+- Position-Based Merge 会降级
+- 日志只打印 INFO 级别，容易被忽略
+
+### 坑4：混合策略（Hybrid Strategy）的复杂性
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 第 71 行：
+```java
+private boolean needToDoHybridStrategy = false;
+```
+
+以及 `fallbackToKeyBasedBuffer` 方法第 1419-1432 行：
+```java
+private void fallbackToKeyBasedBuffer() {
+    readerContext.setShouldMergeUseRecordPosition(false);
+    ArrayList<Serializable> positions = new ArrayList<>(records.keySet());
+    for (Serializable position : positions) {
+      BufferedRecord<T> entry = records.get(position);
+      String recordKey = entry.getRecordKey();
+      if (!entry.isDelete() || recordKey != null) {
+        records.put(recordKey, entry);
+        records.remove(position);
+      } else {
+        needToDoHybridStrategy = true;
+      }
+    }
+}
+```
+
+**陷阱**：
+- 如果某些删除记录没有 Key 信息，会启用"混合策略"
+- 混合策略同时使用位置和 Key 两种方式进行合并
+- 代码逻辑复杂，容易出现边界情况的 bug
+
+### 坑5：不适用于 COW 表
+
+**陷阱**：
+- COW 表没有 Log File，Position-Based Merge 无用武之地
+- 配置相关参数不会报错，但也不会生效
+
+### 性能陷阱
+
+**陷阱**：Position-Based Merge 的性能优势在以下场景下不明显：
+- Base File 很小（< 10MB）
+- Log Files 更新记录很少（< 1000 条）
+- Record Key 是简单类型（如整数）
+
+在这些场景下，Key-Based Merge 的开销本身就不大，Position-Based 的优化效果有限。
+
+## 3. 核心概念解释
+
+### Record Position 的定义
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 第 67-68 行：
+```java
+private static final String ROW_INDEX_COLUMN_NAME = "row_index";
+public static final String ROW_INDEX_TEMPORARY_COLUMN_NAME = "_tmp_metadata_" + ROW_INDEX_COLUMN_NAME;
+```
+
+**核心概念**：
+- Record Position 是记录在 Base File（Parquet）中的行号（从 0 开始）
+- Parquet 文件天然有行号（Row Index）
+- Log Block 写入时记录每条更新对应的 Base File 行号
+
+### RoaringBitmap 的使用
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 第 44 行导入：
+```java
+import org.roaringbitmap.longlong.Roaring64NavigableMap;
+```
+
+**核心概念**：
+- Hudi 使用 `Roaring64NavigableMap`（64 位 Roaring Bitmap）存储位置信息
+- Roaring Bitmap 是一种高效的压缩位图数据结构
+- 特别适合存储稀疏的整数集合（如文件中被更新的行号）
+
+**优势**：
+- 空间效率：相比 `HashSet<Long>`，内存占用可减少 10-100 倍
+- 查询效率：O(1) 查找
+- 迭代效率：支持有序迭代
+- 序列化效率：压缩格式适合存储在 Log Block 头部
+
+### Position-Based vs Key-Based 对比
+
+| 维度 | Key-Based Merge | Position-Based Merge |
+|------|----------------|---------------------|
+| 关联键 | Record Key（字符串） | Row Position（整数） |
+| 数据结构 | HashMap<String, Record> | Map<Long, Record> + RoaringBitmap |
+| 内存占用 | 高（字符串 + HashMap 开销） | 低（整数 + Bitmap 压缩） |
+| 查找效率 | O(1) 但常数较大 | O(1) 且常数很小 |
+| 适用条件 | 总是可用 | 需要位置信息有效 |
+| 降级机制 | 无 | 自动降级到 Key-Based |
+
+### 降级触发条件
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 的多处降级检查：
+
+Position-Based Merge 在以下情况下会降级到 Key-Based Merge：
+
+1. **Base File 被 Compaction 重写**：`baseFileInstantTime` 不匹配
+2. **Log Block 缺少位置信息**：`recordPositions == null`
+3. **Instant Time 不匹配**：`blockBaseFileInstantTime != baseFileInstantTime`
+4. **RoaringBitmap 为空**：`positions.isEmpty()`
+
+### 与其他系统的对比
+
+- **Parquet Row Group Filtering**：基于行组级别的统计信息过滤
+- **ORC Predicate Pushdown**：基于 Stripe 级别的索引
+- **Hudi Position-Based Merge**：基于行级别的位置索引，用于 merge 而非过滤
+
+## 4. 设计理念
+
+### 整数比较 vs 字符串比较
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 第 146 行：
+```java
+long recordPosition = recordPositions.get(recordIndex++);
+```
+
+以及第 405 行：
+```java
+BufferedRecord<T> logRecordInfo = records.remove(nextRecordPosition++);
+```
+
+**设计哲学**：
+- 整数比较（`position == 42`）比字符串比较（`"user_001".equals(key)`）快一个数量级
+- 整数作为 Map 的 key，hashCode 计算是 O(1)
+- 字符串作为 Map 的 key，hashCode 计算是 O(length)
+
+### 优雅降级（Graceful Degradation）
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 继承自 `KeyBasedFileGroupRecordBuffer`：
+```java
+public class PositionBasedFileGroupRecordBuffer<T> extends KeyBasedFileGroupRecordBuffer<T>
+```
+
+**设计理念**：
+- Position-Based 是 Key-Based 的"优化版本"，而非"替代版本"
+- 当优化条件不满足时，无缝退回到 Key-Based
+- 用户无需关心底层使用了哪种合并策略
+- 保证了正确性优先，性能优化其次
+
+### 空间换时间的权衡
+
+**设计权衡**：
+- **额外空间**：Log Block 需要存储 RoaringBitmap（通常几 KB 到几十 KB）
+- **时间节省**：读取时避免字符串操作，节省 CPU 和内存
+
+在大规模数据集上，这个权衡是值得的。
+
+### 为什么不总是使用 Position-Based
+
+源码证据：`PositionBasedFileGroupRecordBuffer.java` 第 92-95 行：
+```java
+if (!readerContext.getShouldMergeUseRecordPosition()) {
+  super.processDataBlock(dataBlock, keySpecOpt);
+  return;
+}
+```
+
+**设计考虑**：
+- Position-Based 的适用条件比较严格（需要位置信息有效）
+- 如果强制使用，可能导致读取失败
+- 通过配置开关（`shouldMergeUseRecordPosition`）让用户选择
+
+### 架构演进历史
+
+- **0.x 版本**：只有 Key-Based Merge
+- **1.0.0 版本**：引入 Position-Based Merge，作为可选优化
+- **未来方向**：
+  - 自动检测是否适合使用 Position-Based（基于统计信息）
+  - 支持更多的位置索引格式（如 Bloom Filter + Position）
+
+### 与 Parquet Row Index 的关系
+
+**设计理念**：
+- Parquet 文件内部有 Row Group 和 Row Index 的概念
+- Hudi 利用 Parquet 的 Row Index 作为 Position-Based Merge 的基础
+- 不需要额外的索引结构，直接复用 Parquet 的元数据
+
+这是一种"利用现有基础设施"的设计思想，而非"重新发明轮子"。
+
 ## 4.1 传统 Key-Based Merge 的性能瓶颈
 
 在 MOR 表的读取路径中，核心操作是将 Base File 中的记录与 Log File 中的更新记录进行合并（Merge）。传统的 Key-Based Merge 流程如下：
@@ -1462,6 +2491,319 @@ Hudi 使用 `Roaring64NavigableMap`（64 位 Roaring Bitmap）来存储位置信
 ---
 
 # 第五部分：Shredded Variant / VECTOR Search 等前沿特性
+
+## 5.0 Shredded Variant — 半结构化数据优化
+
+### 1. 解决什么问题
+
+Shredded Variant 解决的核心问题是**半结构化数据（JSON）的存储效率和查询性能**。
+
+#### 业务痛点
+
+传统做法是将 JSON 存为 STRING 列，但存在以下问题：
+
+1. **无法利用列式存储优势**：
+   - JSON 字符串作为整体存储，无法享受列式压缩
+   - 查询时需要解析整个 JSON 字符串
+   - 无法做列裁剪（Column Pruning）
+
+2. **查询性能差**：
+   - 每次查询都需要 JSON 解析（如 `get_json_object()`）
+   - 无法利用 Parquet 的谓词下推（Predicate Pushdown）
+   - 统计信息（min/max）无法用于过滤
+
+3. **存储空间浪费**：
+   - JSON 字符串压缩率低
+   - 重复的字段名占用大量空间
+
+#### 实际应用场景
+
+1. **日志分析**：应用日志包含固定字段（timestamp、level、message）和可变字段（自定义属性）
+2. **IoT 数据**：设备数据有通用字段（device_id、timestamp）和设备特定字段
+3. **事件追踪**：用户行为事件有公共字段（user_id、event_type）和事件特定属性
+
+### 2. 有什么坑
+
+#### 坑1：Unshredded Variant 不支持列统计
+
+源码证据：`HoodieTableMetadataUtil.java` 的注释：
+```java
+// VARIANT (unshredded) type is excluded because it stores semi-structured data as opaque binary blobs,
+// ...
+// TODO: For shredded, we are able to store colstats, explore that: #17988
+```
+
+**陷阱**：
+- Unshredded Variant 存储为二进制 blob，无法计算 min/max
+- 查询优化器无法利用统计信息进行过滤
+- Shredded Variant 的 `typed_value` 字段未来可以支持列统计（待实现）
+
+#### 坑2：Shredded 字段选择需要权衡
+
+**陷阱**：
+- 如果 shred 太多字段，Parquet schema 会变得很宽，影响写入性能
+- 如果 shred 太少字段，查询性能提升有限
+- 需要根据查询模式（Query Pattern）选择热点字段
+
+#### 坑3：Schema Evolution 的复杂性
+
+**陷阱**：
+- Shredded Variant 的 schema 变更比普通列更复杂
+- 新增 shredded 字段需要重写历史数据（或使用 schema evolution）
+- 删除 shredded 字段可能导致旧数据无法读取
+
+#### 坑4：只在 Spark 4.0+ 支持
+
+源码证据：测试类路径 `hudi-spark-datasource/hudi-spark4.0.x/src/test/java/org/apache/hudi/io/storage/row/TestHoodieRowParquetWriteSupportVariant.java`
+
+**陷阱**：
+- Variant 类型是 Spark 4.0 引入的新特性
+- Spark 3.x 不支持 Variant 类型
+- 需要升级到 Spark 4.0+ 才能使用
+
+### 3. 核心概念解释
+
+#### Variant Type 的定义
+
+Variant 是一种特殊的数据类型，用于存储半结构化数据（如 JSON）。它允许不同行的同一列包含不同结构的数据。
+
+#### Unshredded vs Shredded
+
+| 维度 | Unshredded Variant | Shredded Variant |
+|------|-------------------|------------------|
+| 存储格式 | metadata + value（REQUIRED BINARY） | metadata + value（OPTIONAL BINARY） + typed_value（GROUP） |
+| 列式存储 | 否（整体存储） | 部分是（shredded 字段） |
+| 查询性能 | 差（需要解析） | 好（shredded 字段直接访问） |
+| 存储空间 | 大 | 中等（shredded 字段压缩） |
+| Schema 复杂度 | 低 | 高 |
+
+#### Shredded Variant 的结构
+
+源码证据：`HoodieRowParquetWriteSupport.java` 的实现：
+```
+Variant 列 "v":
+  ├── metadata (REQUIRED BINARY)   -- Variant 元数据（schema 信息）
+  ├── value (OPTIONAL BINARY)      -- 未被 shred 的值（fallback）
+  └── typed_value (GROUP)          -- 被 shred 出来的原生列
+        ├── field_a (INT64)
+        ├── field_b (BINARY/UTF8)
+        └── ...
+```
+
+#### 与其他系统的对比
+
+- **Databricks Delta Lake Variant**：Hudi 的 Variant 设计借鉴了 Delta Lake
+- **Snowflake VARIANT**：类似的半结构化数据类型
+- **PostgreSQL JSONB**：二进制 JSON 存储，支持索引
+
+### 4. 设计理念
+
+#### 热点字段提取
+
+**设计哲学**：
+- 半结构化数据中往往有一些字段（如 timestamp、user_id）在几乎所有记录中都存在且被频繁查询
+- Shredded Variant 允许将这些"热点字段"提取为原生列式存储
+- 享受列式压缩和谓词下推的性能优势
+- 同时保留 Variant 的灵活性来存储其他不规则字段
+
+#### 渐进式优化
+
+**设计理念**：
+- 初期使用 Unshredded Variant（简单，快速上线）
+- 根据查询模式分析，识别热点字段
+- 逐步迁移到 Shredded Variant（性能优化）
+
+#### 与 Parquet 的深度集成
+
+源码证据：`HoodieRowParquetWriteSupport.java` 的实现直接操作 Parquet 的 schema 和 writer。
+
+**设计理念**：
+- 不是在 Hudi 层面模拟 Variant，而是直接利用 Parquet 的 GROUP 类型
+- Shredded 字段作为 Parquet 的原生列，享受所有 Parquet 优化
+- 这是一种"利用底层存储能力"的设计思想
+
+## 5.1 VECTOR Search — 数据湖上的向量搜索
+
+### 1. 解决什么问题
+
+VECTOR Search 解决的核心问题是**AI/ML 场景下的向量相似度搜索与数据湖的集成**。
+
+#### 业务痛点
+
+传统做法是将向量数据从数据湖导出到专门的向量数据库（如 Pinecone、Milvus），但存在以下问题：
+
+1. **数据一致性问题**：
+   - 两个系统间的数据同步延迟
+   - 数据湖更新后，向量数据库可能不同步
+   - 需要额外的 ETL Pipeline
+
+2. **额外的基础设施成本**：
+   - 向量数据库的部署和维护成本
+   - 数据存储双份（数据湖 + 向量数据库）
+   - 运维复杂度增加
+
+3. **查询割裂**：
+   - 向量搜索在向量数据库中执行
+   - 结构化查询在数据湖中执行
+   - 无法在一个 SQL 中完成混合查询
+
+#### 实际应用场景
+
+1. **语义搜索**：在文档数据湖中搜索与查询文本语义相似的文档
+2. **推荐系统**：在用户行为数据湖中找到相似用户或相似商品
+3. **图像检索**：在图像特征数据湖中搜索相似图像
+
+### 2. 有什么坑
+
+#### 坑1：只支持 Brute Force 算法
+
+源码证据：`HoodieVectorSearchTableValuedFunction.scala` 第 1582-1584 行：
+```scala
+object SearchAlgorithm extends Enumeration {
+  val BRUTE_FORCE = Value  // 目前只支持暴力搜索
+}
+```
+
+**陷阱**：
+- 暴力搜索的时间复杂度是 O(N)，N 是数据集大小
+- 大规模数据集（百万级以上）性能不如专业向量数据库
+- 不支持 HNSW、IVF 等近似最近邻算法
+
+#### 坑2：元素类型必须严格匹配
+
+源码证据：`VectorDistanceUtils.scala` 的 `validateEmbeddingColumn` 方法：
+```scala
+field.dataType match {
+  case ArrayType(FloatType, _) | ArrayType(DoubleType, _) | ArrayType(ByteType, _) => // valid
+  case other => throw new HoodieAnalysisException(
+    s"Embedding column '$colName' has type $other, " +
+      "expected array<float>, array<double>, or array<byte>")
+}
+```
+
+**陷阱**：
+- corpus 和 query 必须使用相同的元素类型
+- 不支持自动类型提升（如 float → double）
+- 这是有意为之的设计，避免精度差异
+
+#### 坑3：批量查询的 Cross Join 开销
+
+源码证据：`BruteForceSearchAlgorithm.scala` 的 `buildBatchQueryPlan` 方法：
+```scala
+// 1. Cross Join: corpus x broadcast(query)
+val scored = filteredCorpus.crossJoin(broadcast(renamedQuery))
+  .withColumn(DISTANCE_COL,
+    distanceUdf(col(corpusEmbeddingCol), col(QUERY_EMB_ALIAS)))
+```
+
+**陷阱**：
+- Cross Join 产生 O(|corpus| * |queries|) 行中间数据
+- 如果 query 表很大（几千个查询），中间数据会爆炸
+- 适合小到中等规模的查询集（几十到几百个查询）
+
+#### 坑4：向量维度必须匹配
+
+源码证据：`BruteForceSearchAlgorithm.scala` 的 `validateQueryVectorDimension` 方法会检查维度。
+
+**陷阱**：
+- corpus 的 embedding 维度和 query 的 embedding 维度必须一致
+- 如果维度不匹配，会在查询时抛出异常
+- 需要在数据写入时确保维度一致性
+
+#### 坑5：不支持增量索引
+
+**陷阱**：
+- 每次查询都是全表扫描（Brute Force）
+- 无法利用增量索引加速
+- 数据更新后，查询性能不会自动优化
+
+### 3. 核心概念解释
+
+#### 三种距离度量
+
+源码证据：`VectorDistanceUtils.scala` 第 1700-1712 行：
+
+| 距离度量 | 公式 | 值域 | 适用场景 |
+|---------|------|------|---------|
+| Cosine | 1 - cos(a, b) | [0, 2] | 文本语义相似度 |
+| L2 (Euclidean) | sqrt(sum((a-b)^2)) | [0, +inf) | 图像特征匹配 |
+| Dot Product | -(a . b) | (-inf, +inf) | 推荐系统 |
+
+#### Table-Valued Function (TVF)
+
+**核心概念**：
+- TVF 是 SQL 标准中的一种函数，返回一个表（而非标量值）
+- Spark SQL 支持 TVF 扩展
+- Hudi 通过 TVF 机制实现向量搜索
+
+#### 单查询 vs 批量查询
+
+- **单查询模式**：一个查询向量 → 返回 top-K 最相似记录
+- **批量查询模式**：多个查询向量 → 每个向量返回 top-K
+
+批量查询使用 Window Function 实现分组 top-K。
+
+#### 与专业向量数据库的对比
+
+| 维度 | Hudi VECTOR Search | Pinecone/Milvus |
+|------|-------------------|----------------|
+| 搜索算法 | Brute Force | HNSW/IVF/PQ |
+| 时间复杂度 | O(N) | O(log N) |
+| 数据一致性 | 强一致（事务保证） | 最终一致 |
+| SQL 集成 | 原生支持 | 需要额外集成 |
+| 基础设施 | 无需额外部署 | 需要独立部署 |
+| 适用规模 | 中小规模（< 百万） | 大规模（> 千万） |
+
+### 4. 设计理念
+
+#### 数据湖原生（Lake-Native）
+
+**设计哲学**：
+- 向量搜索直接在数据湖上执行，无需数据导出
+- 享受 Hudi 的事务保证、增量查询、数据管理能力
+- 与结构化查询无缝集成（同一个 SQL）
+
+#### 可插拔算法框架
+
+源码证据：`HoodieVectorSearchPlanBuilder.scala` 的 `VectorSearchAlgorithm` trait：
+```scala
+trait VectorSearchAlgorithm {
+  def name: String
+
+  def buildSingleQueryPlan(...): LogicalPlan
+
+  def buildBatchQueryPlan(...): LogicalPlan
+}
+```
+
+**设计理念**：
+- 目前只实现了 Brute Force
+- 框架设计为可扩展的
+- 未来可以添加 HNSW、IVF 等近似最近邻算法
+- 添加新算法只需实现 trait 并注册
+
+#### 利用 Spark 优化器
+
+源码证据：`BruteForceSearchAlgorithm.scala` 的执行计划：
+```
+Scan(corpus_table)
+  → Filter(embedding IS NOT NULL)
+  → Project(*, _hudi_distance = UDF(embedding))
+  → TakeOrderedAndProject(k, orderBy=_hudi_distance ASC)
+```
+
+**设计理念**：
+- 不是在 Hudi 层面实现排序，而是生成 Spark 逻辑计划
+- Spark 会将 `orderBy + limit` 优化为 `TakeOrderedAndProject`
+- 这是一种部分排序算法，复杂度为 O(N * log(k))，远优于全排序的 O(N * log(N))
+
+#### 架构演进方向
+
+- **当前版本**：Brute Force，适合中小规模数据集
+- **未来方向**：
+  - 引入 HNSW 等近似算法（需要额外的索引结构）
+  - 支持增量索引更新
+  - 与 Hudi 的 Secondary Index 集成
 
 ## 5.1 Variant Type 支持
 

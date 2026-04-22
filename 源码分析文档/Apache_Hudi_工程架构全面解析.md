@@ -260,6 +260,106 @@ packaging/
 
 ### 3.1 表格式设计：COW vs MOR
 
+#### 3.1.1 解决什么问题
+
+**核心问题**: 在数据湖场景下,如何平衡**写入性能**与**查询性能**的矛盾?
+
+- **传统数据湖的困境**: Parquet 等列式格式查询快但更新慢(需要重写整个文件),而行式格式更新快但查询慢
+- **业务场景差异**: 
+  - 批处理场景(如每日 ETL):写入频率低,查询频繁,需要极致的查询性能
+  - 流式场景(如 CDC 实时同步):写入频繁(秒级/分钟级),查询相对较少,需要极致的写入性能
+- **如果没有这个设计**: 用户只能在"快速写入"和"快速查询"之间二选一,无法在同一套系统中兼顾两种场景
+
+**源码证据**:
+```java
+// 文件: hudi-common/src/main/java/org/apache/hudi/common/model/HoodieTableType.java:30
+public enum HoodieTableType {
+  // Performs upserts by versioning entire files, with later versions containing newer value of a record.
+  COPY_ON_WRITE, 
+  // Speeds up upserts, by delaying merge until enough work piles up.
+  MERGE_ON_READ
+}
+```
+
+#### 3.1.2 有什么坑
+
+1. **MOR 表的查询性能陷阱**
+   - **问题**: 如果长时间不执行 Compaction,Log Files 会无限堆积,导致查询时需要合并大量 Log 文件,性能急剧下降
+   - **表现**: 查询延迟从秒级退化到分钟级,甚至 OOM
+   - **根因**: MOR 表的查询需要实时合并 Base File + Log Files,Log 文件越多,合并开销越大
+   - **解决**: 必须配置合理的 Compaction 策略(`hoodie.compact.inline.max.delta.commits`),建议不超过 10 个 delta commits
+
+2. **COW 表的小文件问题**
+   - **问题**: 频繁的小批量更新会产生大量小 Parquet 文件,严重影响查询性能和元数据管理
+   - **表现**: HDFS NameNode 压力大,Spark 查询时 task 数量爆炸
+   - **根因**: COW 表每次更新都重写整个文件,如果更新的记录很少,会产生大量小文件
+   - **解决**: 启用 Clustering(`hoodie.clustering.inline=true`)定期重组文件布局
+
+3. **表类型选择错误**
+   - **坑**: 在高频写入场景(如 Kafka CDC)使用 COW 表,导致写入吞吐量低、延迟高
+   - **坑**: 在低频写入、高频查询场景(如数仓 ODS 层)使用 MOR 表,导致查询性能差且 Compaction 成本高
+   - **原则**: 
+     - 写入频率 > 1次/分钟 → MOR
+     - 写入频率 < 1次/小时 → COW
+     - 中间地带根据查询/写入比例权衡
+
+4. **Read-Optimized Query 的数据新鲜度陷阱**
+   - **问题**: MOR 表的 Read-Optimized Query 只读 Parquet,跳过未 compact 的 Log Files,导致读到的数据不是最新的
+   - **表现**: 业务方反馈"数据延迟",但实际上数据已经写入,只是查询方式不对
+   - **解决**: 明确告知用户 MOR 表有两种查询模式:Snapshot Query(实时,慢) vs Read-Optimized Query(快,但可能不是最新)
+
+#### 3.1.3 核心概念解释
+
+**Copy-On-Write (COW)**:
+- **写入语义**: 每次更新时,读取旧的 Parquet 文件,与新数据合并后,生成新版本的 Parquet 文件
+- **文件结构**: 每个 FileSlice 只包含一个 Parquet 文件(`HoodieBaseFile`),无 Log Files
+- **查询语义**: 直接读取最新版本的 Parquet 文件,无需额外合并操作
+- **适用场景**: 批处理、数仓 ODS/DWD 层、读多写少
+
+**Merge-On-Read (MOR)**:
+- **写入语义**: 增量数据以 Avro 格式追加写入 Log Files(`HoodieLogFile`),无需读取旧数据
+- **文件结构**: 每个 FileSlice 包含一个 Base Parquet 文件 + 多个 Log Files
+- **查询语义**: 
+  - **Snapshot Query**: 读取 Base File + 所有 Log Files,实时合并(慢但数据最新)
+  - **Read-Optimized Query**: 只读取 Base File,跳过 Log Files(快但数据可能不是最新)
+- **Compaction**: 后台异步将 Log Files 合并回 Parquet,生成新的 Base File
+- **适用场景**: 流式写入、CDC 同步、写多读少
+
+**关键差异对比**:
+| 维度 | COW | MOR |
+|------|-----|-----|
+| 写入延迟 | 高(需要读取+重写 Parquet) | 低(仅追加 Log) |
+| 查询延迟 | 低(直接读 Parquet) | 中(需合并 Base+Log) |
+| 存储空间 | 中(仅 Parquet) | 高(Parquet + Log) |
+| 写入吞吐 | 低 | 高 |
+| 查询吞吐 | 高 | 中 |
+
+#### 3.1.4 设计理念
+
+**为什么这样设计**:
+
+1. **LSM-Tree 思想的借鉴**
+   - MOR 表的设计借鉴了 LSM-Tree(Log-Structured Merge-Tree)的核心思想:将随机写转化为顺序写
+   - Log Files 的追加写入是顺序 I/O,在云存储(S3/GCS)上性能远优于随机读写
+   - Compaction 类似 LSM-Tree 的 Compaction,将多层数据合并为一层
+
+2. **读写分离的权衡**
+   - COW 将写入成本前置(写时合并),查询时零成本
+   - MOR 将写入成本后置(查询时合并或 Compaction 时合并),写入时零成本
+   - 这种设计让用户可以根据业务特点选择"何时支付合并成本"
+
+3. **与其他系统的对比**
+   - **Delta Lake**: 只支持类似 COW 的模式,没有 MOR 的快速写入能力
+   - **Iceberg**: 支持 MOR(通过 Delete Files),但 Compaction 策略不如 Hudi 灵活
+   - **Hudi 的优势**: 两种模式都支持,且可以在同一表上动态切换(通过 `hoodie.table.type` 配置)
+
+4. **架构演进历史**
+   - **v0.3.0 之前**: 只支持 COW
+   - **v0.4.0**: 引入 MOR 表类型,支持 Log Files
+   - **v0.5.0**: 引入 Async Compaction,MOR 表可以在后台异步执行 Compaction
+   - **v0.6.0**: 引入 Inline Compaction,支持在写入流程中同步触发 Compaction
+   - **v1.0.0+**: 引入 Log Compaction,支持 Log Files 之间的合并(无需合并到 Parquet)
+
 Hudi 支持两种表类型，这是其最核心的设计决策：
 
 ```
@@ -299,6 +399,140 @@ HoodieTable
 
 ### 3.3 Timeline 机制
 
+#### 3.3.1 解决什么问题
+
+**核心问题**: 在分布式数据湖环境下,如何实现**ACID 事务**、**崩溃恢复**和**增量处理**?
+
+- **数据湖的事务困境**: 传统数据湖(如纯 Parquet 文件)没有事务概念,多个写入者可能产生数据不一致
+- **崩溃恢复难题**: 如果写入过程中 Spark 作业失败,如何判断哪些文件已写入、哪些需要清理?
+- **增量处理需求**: CDC、流式处理场景需要高效地"只读取上次处理后的新数据",而不是全量扫描
+- **如果没有 Timeline**: 
+  - 无法实现原子性提交(要么全部成功,要么全部失败)
+  - 无法回滚失败的写入操作
+  - 无法支持时间旅行查询(查询历史某个时间点的数据)
+  - 无法高效实现增量查询
+
+**源码证据**:
+```java
+// 文件: hudi-common/src/main/java/org/apache/hudi/common/table/timeline/HoodieTimeline.java:46
+/**
+ * HoodieTimeline is a view of meta-data instants in the hoodie table. Instants are specific points in time
+ * represented as HoodieInstant.
+ * Timelines are immutable once created and operations create new instance of timelines which filter on the instants
+ */
+public interface HoodieTimeline extends HoodieInstantReader, Serializable {
+  String COMMIT_ACTION = "commit";
+  String DELTA_COMMIT_ACTION = "deltacommit";
+  String CLEAN_ACTION = "clean";
+  String ROLLBACK_ACTION = "rollback";
+  String SAVEPOINT_ACTION = "savepoint";
+  String REPLACE_COMMIT_ACTION = "replacecommit";
+  String COMPACTION_ACTION = "compaction";
+  // ... 共 11 种 action 类型
+}
+```
+
+#### 3.3.2 有什么坑
+
+1. **Timeline 无限增长导致性能下降**
+   - **问题**: 每次写入都会在 `.hoodie/` 目录下生成 instant 文件,长期运行后 Timeline 文件数量可达数万个
+   - **表现**: `HoodieTableMetaClient` 初始化时需要 list `.hoodie/` 目录,耗时从毫秒级增长到分钟级
+   - **根因**: Hudi 默认不会自动删除旧的 instant 文件
+   - **解决**: 必须启用 Archival(`hoodie.archive.automatic=true`),定期将旧 instant 归档到 `.hoodie/archived/` 目录
+
+2. **时钟偏移导致的 instant 乱序**
+   - **问题**: 在多写者场景下,不同机器的系统时钟可能不同步,导致后提交的 instant 时间戳反而更小
+   - **表现**: 增量查询可能漏读数据,或者读到乱序的数据
+   - **根因**: Hudi 默认使用 `System.currentTimeMillis()` 生成时间戳
+   - **解决**: 使用 `SkewAdjustingTimeGenerator`(源码位于 `hudi-common/src/main/java/org/apache/hudi/common/table/timeline/SkewAdjustingTimeGenerator.java`),它会检测时钟偏移并自动调整
+
+3. **INFLIGHT instant 未清理导致的写入阻塞**
+   - **问题**: 如果写入作业异常退出(如 Spark Executor OOM),会留下 `.inflight` 文件,下次写入时 Hudi 会认为有写入正在进行而拒绝新的写入
+   - **表现**: 报错 "Another commit is in progress"
+   - **根因**: Hudi 通过 `.inflight` 文件实现写入互斥锁
+   - **解决**: 手动删除 `.hoodie/*.inflight` 文件,或者启用 `hoodie.write.lock.provider` 使用分布式锁
+
+4. **Rollback 操作的级联效应**
+   - **问题**: Rollback 一个 commit 后,依赖该 commit 的后续操作(如 Compaction、Clean)也需要 rollback,但 Hudi 不会自动处理
+   - **表现**: 数据不一致,查询结果异常
+   - **解决**: 使用 `HoodieCLI` 的 `rollback` 命令时,需要手动检查并 rollback 依赖的操作
+
+#### 3.3.3 核心概念解释
+
+**HoodieInstant** — Timeline 的基本单元:
+```java
+// 文件: hudi-common/src/main/java/org/apache/hudi/common/table/timeline/HoodieInstant.java
+public class HoodieInstant implements Serializable, Comparable<HoodieInstant> {
+  private final State state;        // REQUESTED, INFLIGHT, COMPLETED
+  private final String action;      // commit, deltacommit, compaction, clean, rollback...
+  private final String timestamp;   // 精确到毫秒的时间戳,格式: yyyyMMddHHmmssSSS
+  private final String requestedTime; // 请求时间(用于 Compaction 等异步操作)
+}
+```
+
+**Instant 状态机**:
+```
+REQUESTED → INFLIGHT → COMPLETED
+    ↓          ↓
+  (删除)    (Rollback)
+```
+- **REQUESTED**: 操作已请求但未开始执行(如 Compaction Plan 已生成)
+- **INFLIGHT**: 操作正在执行中(如正在写入数据文件)
+- **COMPLETED**: 操作已完成(如 commit 已成功)
+
+**Action 类型**:
+| Action | 含义 | 文件后缀 | 适用表类型 |
+|--------|------|---------|-----------|
+| `commit` | COW 表的写入提交 | `.commit` | COW |
+| `deltacommit` | MOR 表的写入提交 | `.deltacommit` | MOR |
+| `compaction` | MOR 表的 Compaction | `.compaction` | MOR |
+| `clean` | 清理旧版本文件 | `.clean` | 通用 |
+| `rollback` | 回滚失败的提交 | `.rollback` | 通用 |
+| `savepoint` | 创建保存点 | `.savepoint` | 通用 |
+| `replacecommit` | Clustering 提交 | `.replacecommit` | 通用 |
+| `restore` | 恢复到某个保存点 | `.restore` | 通用 |
+
+**Timeline 类型**:
+- **ActiveTimeline**: 活跃的 instant(未归档),存储在 `.hoodie/` 目录
+- **ArchivedTimeline**: 已归档的 instant,存储在 `.hoodie/archived/` 目录,使用 Avro 格式压缩存储
+
+#### 3.3.4 设计理念
+
+**为什么这样设计**:
+
+1. **事务日志 (Write-Ahead Log) 思想**
+   - Timeline 本质上是一个**只追加的事务日志**,每个 instant 文件记录了一次操作的元数据
+   - 通过文件系统的原子性操作(rename)实现 instant 状态的原子切换
+   - 这种设计借鉴了数据库的 WAL(Write-Ahead Logging)机制
+
+2. **文件系统作为元数据存储**
+   - Hudi 将 Timeline 存储在文件系统上(`.hoodie/` 目录),而非依赖外部元数据服务(如 Hive Metastore)
+   - **优势**: 
+     - 无需额外的元数据服务,降低运维成本
+     - 元数据与数据文件在同一存储系统,保证一致性
+     - 支持任意文件系统(HDFS/S3/GCS/本地文件系统)
+   - **劣势**: 
+     - 大规模表的 Timeline listing 性能较差(通过 Timeline Server 和 Metadata Table 优化)
+
+3. **三阶段提交协议**
+   - REQUESTED → INFLIGHT → COMPLETED 的状态机实现了类似两阶段提交的协议
+   - **REQUESTED**: 预留时间戳,生成执行计划(如 Compaction Plan)
+   - **INFLIGHT**: 执行实际的数据写入,此时其他写入者可以看到有操作正在进行
+   - **COMPLETED**: 原子性地将 `.inflight` 文件 rename 为 `.commit`,标志操作成功
+
+4. **与其他系统的对比**
+   - **Delta Lake**: 使用 `_delta_log/` 目录存储事务日志,采用 JSON 格式,设计思想类似
+   - **Iceberg**: 使用 `metadata/` 目录存储 manifest 文件,采用 Avro 格式,但不支持 INFLIGHT 状态
+   - **Hudi 的优势**: 
+     - 支持更细粒度的状态机(REQUESTED/INFLIGHT/COMPLETED)
+     - 支持更丰富的 action 类型(11 种 vs Delta Lake 的 7 种)
+     - 支持 Archival 机制,避免 Timeline 无限增长
+
+5. **时间戳生成策略**
+   - 默认使用 `System.currentTimeMillis()`,格式为 `yyyyMMddHHmmssSSS`(17 位)
+   - 支持 `SkewAdjustingTimeGenerator`,自动检测并修正时钟偏移
+   - 支持 `FailSafeTimeGenerator`,在时钟回拨时抛出异常,避免数据不一致
+
 Timeline 是 Hudi 的**事务日志系统**——所有的写操作都被建模为一个有序的 instant 序列：
 
 ```
@@ -318,6 +552,159 @@ Timeline: t1.commit → t2.commit → t3.deltacommit → t4.compaction → t5.cl
 - 提供**原子性提交**和**崩溃恢复**
 
 ### 3.4 索引体系
+
+#### 3.4.1 解决什么问题
+
+**核心问题**: 在 upsert 操作中,如何**快速定位**一条记录(由 recordKey 标识)存储在哪个文件中?
+
+- **Upsert 的挑战**: 
+  - 给定一条新记录,需要判断它是 insert(新记录)还是 update(已存在记录)
+  - 如果是 update,需要找到旧记录所在的文件,读取旧数据并合并
+  - 如果没有索引,只能全表扫描所有文件,性能无法接受
+- **数据湖的特殊性**:
+  - 数据分散在数千个 Parquet 文件中
+  - 文件数量随数据量线性增长
+  - 云存储的随机读取延迟高(S3 单次请求 ~100ms)
+- **如果没有索引**:
+  - Upsert 操作需要读取所有文件,时间复杂度 O(N),N 为文件数量
+  - 对于 TB 级数据,可能需要扫描数万个文件,耗时数小时
+
+**源码证据**:
+```java
+// 文件: hudi-client/hudi-client-common/src/main/java/org/apache/hudi/index/HoodieIndex.java:80
+public abstract class HoodieIndex<I, O> implements Serializable {
+  /**
+   * Looks up the index and tags each incoming record with a location of a file that contains
+   * the row (if it is actually present).
+   */
+  @PublicAPIMethod(maturity = ApiMaturityLevel.EVOLVING)
+  public abstract <R> HoodieData<HoodieRecord<R>> tagLocation(
+      HoodieData<HoodieRecord<R>> records, HoodieEngineContext context,
+      HoodieTable hoodieTable) throws HoodieIndexException;
+
+  /**
+   * An index is `global` if HoodieKey to fileID mapping, does not depend on the `partitionPath`.
+   */
+  @PublicAPIMethod(maturity = ApiMaturityLevel.STABLE)
+  public abstract boolean isGlobal();
+
+  /**
+   * This is used by storage to determine, if it is safe to send inserts, straight to the log.
+   */
+  @PublicAPIMethod(maturity = ApiMaturityLevel.EVOLVING)
+  public abstract boolean canIndexLogFiles();
+}
+```
+
+#### 3.4.2 有什么坑
+
+1. **Bloom Index 的假阳性问题**
+   - **问题**: 布隆过滤器有假阳性(False Positive),可能误判记录存在于某个文件中
+   - **表现**: Upsert 操作读取了不必要的文件,浪费 I/O
+   - **根因**: 布隆过滤器的假阳性率由 `hoodie.index.bloom.fpp`(默认 0.000000001)控制,但无法完全消除
+   - **解决**: 调整 FPP 参数,或者使用 RECORD_INDEX(精确索引,无假阳性)
+
+2. **Global Index 的性能陷阱**
+   - **问题**: Global Index 需要扫描所有分区的索引,在大表上性能很差
+   - **表现**: tagLocation 操作耗时从秒级增长到分钟级
+   - **根因**: Global Index 不利用分区信息,需要检查所有分区的所有文件
+   - **解决**: 只有在 recordKey 可能跨分区移动的场景下才使用 Global Index,否则使用分区级索引
+
+3. **Bucket Index 的桶数选择错误**
+   - **问题**: 桶数设置过小,导致单个桶的数据量过大,查询性能下降;桶数设置过大,导致小文件问题
+   - **表现**: 查询时单个 task 处理的数据量不均衡,出现数据倾斜
+   - **根因**: Simple Bucket Index 的桶数固定,无法动态调整
+   - **解决**: 使用 Consistent Hashing Bucket Index,支持动态扩缩容
+
+4. **索引类型选择错误**
+   - **坑**: 在小表(<1GB)上使用 RECORD_INDEX,导致索引开销大于收益
+   - **坑**: 在超大表(>10TB)上使用 BLOOM Index,导致索引查找性能差
+   - **原则**:
+     - 小表(<10GB): SIMPLE Index
+     - 中等表(10GB~1TB): BLOOM Index
+     - 大表(>1TB): BUCKET Index 或 RECORD_INDEX
+     - 流式场景(Flink): FlinkStateIndex
+
+5. **索引更新的延迟**
+   - **问题**: 在 MOR 表上,索引只在 Compaction 后更新,导致索引不是最新的
+   - **表现**: Upsert 操作可能找不到最近写入的记录,导致重复写入
+   - **根因**: 索引更新依赖 Base File,而 MOR 表的增量数据在 Log Files 中
+   - **解决**: 启用 `hoodie.index.canIndexLogFiles=true`,让索引支持 Log Files
+
+#### 3.4.3 核心概念解释
+
+**索引的核心能力**:
+- **tagLocation**: 给定一批记录,查找每条记录的存储位置(fileId + partitionPath)
+- **updateLocation**: 写入完成后,更新索引,记录新的 recordKey → fileId 映射
+
+**索引类型对比**:
+
+| 索引类型 | 查找复杂度 | 空间开销 | 是否全局 | 是否精确 | 适用场景 |
+|---------|-----------|---------|---------|---------|---------|
+| **SIMPLE** | O(N) Join | 无 | 可选 | 精确 | 小表,测试 |
+| **BLOOM** | O(log N) | 低(每文件 ~KB) | 可选 | 假阳性 | 中等表,批处理 |
+| **BUCKET** | O(1) | 无 | 否 | 精确 | 大表,高吞吐 |
+| **RECORD_INDEX** | O(1) | 高(每记录 ~100B) | 是 | 精确 | 超大表,精确查找 |
+| **FlinkState** | O(1) | 高(内存) | 否 | 精确 | Flink 流式 |
+
+**BLOOM Index 工作原理**:
+1. 每个 Parquet 文件的 footer 中存储一个布隆过滤器(记录该文件包含的所有 recordKey)
+2. tagLocation 时,先读取所有文件的布隆过滤器(通过 Metadata Table 加速)
+3. 对于每条记录,检查哪些文件的布隆过滤器返回"可能存在"
+4. 读取这些候选文件,精确查找记录
+
+**BUCKET Index 工作原理**:
+1. 根据 recordKey 计算哈希值,映射到固定的桶(bucket)
+2. 每个桶对应一个 fileId,所有属于该桶的记录都写入同一文件
+3. tagLocation 时,直接根据哈希值计算出 fileId,O(1) 复杂度
+4. Consistent Hashing Bucket 支持动态增加/减少桶数,避免全量数据重分布
+
+**RECORD_INDEX 工作原理**:
+1. 在 Metadata Table 的 `record_index` 分区中,存储 recordKey → (fileId, partitionPath) 的精确映射
+2. Metadata Table 使用 HFile 格式,支持 O(1) 点查
+3. tagLocation 时,直接查询 Metadata Table,无需读取数据文件
+4. 空间开销:每条记录约 100 字节(recordKey + fileId + partition)
+
+#### 3.4.4 设计理念
+
+**为什么这样设计**:
+
+1. **多索引策略的权衡**
+   - 不同场景下,查找性能、空间开销、维护成本的权衡完全不同
+   - BLOOM: 空间效率高,但有假阳性,适合"宁可错杀,不可放过"的场景
+   - BUCKET: 查找最快,但需要预先规划桶数,适合数据分布均匀的场景
+   - RECORD_INDEX: 最精确,但空间开销大,适合超大表且查询频繁的场景
+
+2. **索引与存储的解耦**
+   - `HoodieIndex` 是一个抽象接口,与具体的存储格式(Parquet/Avro)解耦
+   - 索引可以存储在:
+     - 数据文件内部(BLOOM 过滤器在 Parquet footer)
+     - Metadata Table(RECORD_INDEX)
+     - 外部系统(HBase Index,已废弃)
+     - 内存(FlinkStateIndex)
+
+3. **Global vs Partition-Level 的设计**
+   - **Partition-Level Index**: 假设 recordKey 不会跨分区移动,只在记录所属分区内查找
+   - **Global Index**: 不依赖分区信息,在所有分区中查找
+   - **适用场景**:
+     - Partition-Level: 分区键稳定(如按日期分区),性能更好
+     - Global: 分区键可能变化(如用户从一个城市搬到另一个城市),保证数据唯一性
+
+4. **与其他系统的对比**
+   - **Delta Lake**: 不提供内置索引,依赖 Data Skipping(列统计信息)和 Z-Order Clustering
+   - **Iceberg**: 不提供内置索引,依赖 Manifest 文件的分区裁剪
+   - **Hudi 的优势**: 
+     - 提供多种索引类型,适配不同场景
+     - BUCKET Index 的 O(1) 查找性能是 Hudi 独有的
+     - RECORD_INDEX 利用 Metadata Table,实现精确且高效的查找
+
+5. **索引演进历史**
+   - **v0.3.0**: 只支持 BLOOM Index 和 SIMPLE Index
+   - **v0.5.0**: 引入 HBase Index(已废弃)
+   - **v0.9.0**: 引入 BUCKET Index
+   - **v0.10.0**: 引入 Consistent Hashing Bucket Index
+   - **v0.12.0**: 引入 RECORD_INDEX(基于 Metadata Table)
+   - **v0.14.0**: 引入 FlinkStateIndex(Flink 专用)
 
 Hudi 的索引体系是其**高效 upsert 能力**的关键。索引通过不同的实现类提供多种策略：
 
@@ -344,6 +731,180 @@ HoodieIndex (抽象基类: hudi-client/hudi-client-common/src/main/java/org/apac
 
 ### 3.5 Metadata Table（元数据表）
 
+#### 3.5.1 解决什么问题
+
+**核心问题**: 在云存储(S3/GCS)上,如何**高效获取**文件列表、列统计信息、布隆过滤器等元数据?
+
+- **云存储的元数据困境**:
+  - S3 的 `listObjects` 操作延迟高(~100ms/请求),且有 API 调用成本
+  - 大表可能有数万个文件,listing 操作耗时可达分钟级
+  - 每次查询都需要 list 文件,无法缓存(文件可能随时变化)
+- **传统方案的局限**:
+  - 直接 list 文件系统:慢,且无法获取列统计信息、布隆过滤器等高级元数据
+  - 使用 Hive Metastore:需要额外的服务,且元数据更新不及时
+- **如果没有 Metadata Table**:
+  - 每次查询都需要 list 所有分区的所有文件
+  - 无法进行文件级数据裁剪(Data Skipping)
+  - 索引查找(如 BLOOM Index)需要读取所有文件的 footer
+
+**源码证据**:
+```java
+// 文件: hudi-common/src/main/java/org/apache/hudi/metadata/MetadataPartitionType.java:91
+@Getter
+public enum MetadataPartitionType {
+  FILES(HoodieTableMetadataUtil.PARTITION_NAME_FILES, "files-", 2) {
+    @Override
+    public boolean isMetadataPartitionEnabled(HoodieMetadataConfig metadataConfig, HoodieTableConfig tableConfig) {
+      return metadataConfig.isEnabled();  // 默认启用
+    }
+  },
+  COLUMN_STATS(HoodieTableMetadataUtil.PARTITION_NAME_COLUMN_STATS, "col-stats-", 3) {
+    @Override
+    public boolean isMetadataPartitionEnabled(HoodieMetadataConfig metadataConfig, HoodieTableConfig tableConfig) {
+      return metadataConfig.isColumnStatsIndexEnabled();
+    }
+  },
+  BLOOM_FILTERS(HoodieTableMetadataUtil.PARTITION_NAME_BLOOM_FILTERS, "bloom-filters-", 4),
+  RECORD_INDEX(HoodieTableMetadataUtil.PARTITION_NAME_RECORD_INDEX, "record-index-", 5),
+  // ... 共 8 种分区类型
+}
+```
+
+#### 3.5.2 有什么坑
+
+1. **Metadata Table 损坏导致查询失败**
+   - **问题**: 如果 Metadata Table 的数据与实际数据文件不一致,会导致查询结果错误或查询失败
+   - **表现**: 报错 "File not found" 或查询结果缺少数据
+   - **根因**: 
+     - 写入失败但 Metadata Table 已更新
+     - 手动删除数据文件但未更新 Metadata Table
+     - 并发写入导致 Metadata Table 更新不及时
+   - **解决**: 
+     - 禁用 Metadata Table(`hoodie.metadata.enable=false`),回退到直接 list 文件系统
+     - 使用 HoodieCLI 的 `metadata validate` 命令检查一致性
+     - 使用 `metadata init` 命令重建 Metadata Table
+
+2. **Metadata Table 的写入放大**
+   - **问题**: 每次数据表写入,都需要同步更新 Metadata Table,导致写入延迟增加
+   - **表现**: 写入耗时增加 20%~50%
+   - **根因**: Metadata Table 本身是一个 MOR 表,写入需要生成 Log Files 并定期 Compaction
+   - **解决**: 
+     - 调整 Metadata Table 的 Compaction 策略
+     - 在写入密集型场景下,可以考虑禁用 COLUMN_STATS 等高开销的分区
+
+3. **COLUMN_STATS 的内存开销**
+   - **问题**: 启用 COLUMN_STATS 后,写入时需要在内存中维护每列的 min/max/count 等统计信息
+   - **表现**: Spark Executor OOM
+   - **根因**: 对于宽表(数百列),统计信息的内存开销可达 GB 级别
+   - **解决**: 
+     - 只对查询频繁的列启用 COLUMN_STATS
+     - 增加 Executor 内存
+     - 使用 `hoodie.metadata.index.column.stats.column.list` 指定需要统计的列
+
+4. **RECORD_INDEX 的空间开销**
+   - **问题**: RECORD_INDEX 为每条记录存储 recordKey → fileId 映射,空间开销巨大
+   - **表现**: Metadata Table 的大小接近数据表大小的 10%~20%
+   - **根因**: 每条记录约 100 字节的索引数据
+   - **解决**: 
+     - 只在超大表(>10TB)且查询频繁的场景下启用 RECORD_INDEX
+     - 对于中小表,使用 BLOOM Index 更经济
+
+5. **Metadata Table 的初始化时间**
+   - **问题**: 对于已有的大表,首次启用 Metadata Table 需要扫描所有数据文件,耗时可达数小时
+   - **表现**: 首次写入时卡在 "Initializing Metadata Table"
+   - **根因**: 需要读取所有 Parquet 文件的 footer,提取文件列表、布隆过滤器、列统计信息
+   - **解决**: 
+     - 使用 `HoodieCLI` 的 `metadata init` 命令在后台初始化
+     - 分批初始化,先启用 FILES 分区,再逐步启用其他分区
+
+#### 3.5.3 核心概念解释
+
+**Metadata Table 的本质**:
+- Metadata Table 本身是一个**Hudi MOR 表**,存储在 `<basePath>/.hoodie/metadata/` 目录
+- 它使用 HFile 格式存储数据(而非 Parquet),支持 O(1) 点查
+- 每次数据表写入时,Metadata Table 会同步更新(类似数据库的二级索引)
+
+**分区类型详解**:
+
+| 分区类型 | 存储内容 | Key | Value | 用途 | 空间开销 |
+|---------|---------|-----|-------|------|---------|
+| **FILES** | 文件列表 | partitionPath | List<HoodieMetadataFileInfo> | 替代 fs.list | 低(~1% 数据大小) |
+| **COLUMN_STATS** | 列统计信息 | fileName#columnName | HoodieMetadataColumnStats | Data Skipping | 中(~5% 数据大小) |
+| **BLOOM_FILTERS** | 布隆过滤器 | partitionPath#fileName | ByteBuffer(bloom filter) | 加速 BLOOM Index | 低(~1% 数据大小) |
+| **RECORD_INDEX** | 记录索引 | recordKey | (fileId, partition, position) | 精确查找 | 高(~10% 数据大小) |
+| **SECONDARY_INDEX** | 二级索引 | indexKey | List<recordKey> | 非主键查询 | 中(取决于索引列) |
+| **EXPRESSION_INDEX** | 表达式索引 | expression(record) | List<recordKey> | 复杂查询加速 | 中(取决于表达式) |
+| **PARTITION_STATS** | 分区统计 | partitionPath | (recordCount, fileCount) | 查询规划 | 极低 |
+
+**FILES 分区的工作原理**:
+```
+Key: "2024/01/01"  (partitionPath)
+Value: [
+  {fileName: "file1.parquet", size: 128MB, recordCount: 1000000},
+  {fileName: "file2.parquet", size: 64MB, recordCount: 500000}
+]
+```
+- 查询时,直接从 Metadata Table 读取文件列表,无需 list 文件系统
+- 时间复杂度从 O(N) 降低到 O(1),N 为文件数量
+
+**COLUMN_STATS 分区的工作原理**:
+```
+Key: "file1.parquet#user_id"  (fileName#columnName)
+Value: {
+  minValue: 1,
+  maxValue: 1000000,
+  nullCount: 0,
+  valueCount: 1000000,
+  totalSize: 8000000,
+  totalUncompressedSize: 8000000
+}
+```
+- 查询时,根据 WHERE 条件裁剪文件:如 `WHERE user_id = 12345`,只读取 minValue <= 12345 <= maxValue 的文件
+- 这种技术称为 **Data Skipping** 或 **Zone Map**
+
+#### 3.5.4 设计理念
+
+**为什么这样设计**:
+
+1. **元数据即数据 (Metadata as Data)**
+   - Metadata Table 本身是一个 Hudi 表,享受 Hudi 的所有特性:ACID、增量更新、时间旅行
+   - **优势**:
+     - 无需额外的元数据服务(如 Hive Metastore)
+     - 元数据与数据的一致性由 Hudi 的事务机制保证
+     - 元数据可以像数据一样查询、备份、恢复
+   - **劣势**:
+     - 写入放大(每次数据写入都需要更新元数据)
+     - 元数据损坏会影响数据查询
+
+2. **HFile 格式的选择**
+   - Metadata Table 使用 HFile(HBase 的文件格式)而非 Parquet
+   - **原因**:
+     - HFile 支持 O(1) 点查(通过内置的 Bloom Filter 和 Block Index)
+     - Parquet 是列式格式,适合扫描,不适合点查
+     - HFile 的写入性能优于 Parquet(顺序写,无需列式编码)
+   - **实现**: Hudi 自研了轻量级的 HFile Reader(`hudi-io/src/main/java/org/apache/hudi/io/hfile/`),无需依赖 HBase
+
+3. **分区类型的优先级设计**
+   - 每种分区类型有一个优先级(priority),决定初始化顺序
+   - FILES(优先级 2) → COLUMN_STATS(3) → BLOOM_FILTERS(4) → RECORD_INDEX(5)
+   - **原因**: FILES 是最基础的元数据,其他分区依赖 FILES 的文件列表
+
+4. **与其他系统的对比**
+   - **Delta Lake**: 使用 `_delta_log/` 存储事务日志,但不存储列统计信息和布隆过滤器,需要读取 Parquet footer
+   - **Iceberg**: 使用 Manifest 文件存储文件列表和列统计信息,但 Manifest 是 Avro 格式,不支持点查
+   - **Hudi 的优势**:
+     - Metadata Table 支持多种分区类型,功能最丰富
+     - HFile 格式支持 O(1) 点查,性能最优
+     - Metadata Table 本身是 Hudi 表,可以利用 Hudi 的所有特性
+
+5. **演进历史**
+   - **v0.7.0**: 引入 Metadata Table,只支持 FILES 分区
+   - **v0.9.0**: 引入 COLUMN_STATS 分区
+   - **v0.10.0**: 引入 BLOOM_FILTERS 分区
+   - **v0.12.0**: 引入 RECORD_INDEX 分区
+   - **v0.14.0**: 引入 SECONDARY_INDEX 和 EXPRESSION_INDEX 分区
+   - **v1.0.0+**: Metadata Table 成为默认启用的特性
+
 Metadata Table 是一个**内置的 Hudi MOR 表**，用于加速元数据查询：
 
 ```
@@ -364,6 +925,154 @@ MetadataPartitionType (hudi-common/src/main/java/org/apache/hudi/metadata/Metada
 - 列统计信息支持查询时的文件级裁剪（Data Skipping）
 
 ### 3.6 并发控制机制
+
+#### 3.6.1 解决什么问题
+
+**核心问题**: 在多个写入者同时操作同一张 Hudi 表时,如何保证**数据一致性**和**写入正确性**?
+
+- **多写者冲突场景**:
+  - 场景 1: 两个 Spark 作业同时向同一分区写入数据,可能写入同一个 FileGroup,导致数据覆盖
+  - 场景 2: 一个作业正在执行 Compaction,另一个作业同时写入,可能导致 Compaction 结果不一致
+  - 场景 3: 流式写入(Flink/Spark Streaming)需要支持乱序、延迟数据,但不能阻塞其他写入者
+- **如果没有并发控制**:
+  - 数据丢失:后提交的写入覆盖先提交的写入
+  - 数据重复:两个写入者写入相同的记录到不同文件
+  - 元数据不一致:Timeline 中的 instant 顺序与实际数据文件不匹配
+
+**源码证据**:
+```java
+// 文件: hudi-common/src/main/java/org/apache/hudi/common/model/WriteConcurrencyMode.java:30
+@EnumDescription("Concurrency modes for write operations.")
+public enum WriteConcurrencyMode {
+  // Only a single writer can perform write ops
+  @EnumFieldDescription("Only one active writer to the table. Maximizes throughput.")
+  SINGLE_WRITER,
+
+  // Multiple writer can perform write ops with lazy conflict resolution using locks
+  @EnumFieldDescription("Multiple writers can operate on the table with lazy conflict resolution "
+      + "using locks. This means that only one writer succeeds if multiple writers write to the "
+      + "same file group.")
+  OPTIMISTIC_CONCURRENCY_CONTROL,
+
+  // Multiple writer can perform write ops on a MOR table with non-blocking conflict resolution
+  @EnumFieldDescription("Multiple writers can operate on the table with non-blocking conflict resolution. "
+      + "The writers can write into the same file group with the conflicts resolved automatically "
+      + "by the query reader and the compactor.")
+  NON_BLOCKING_CONCURRENCY_CONTROL;
+
+  public boolean supportsMultiWriter() {
+    return this == OPTIMISTIC_CONCURRENCY_CONTROL || this == NON_BLOCKING_CONCURRENCY_CONTROL;
+  }
+}
+```
+
+#### 3.6.2 有什么坑
+
+1. **OCC 模式下的锁超时导致写入失败**
+   - **问题**: 在 OCC 模式下,如果一个写入作业持有锁的时间过长(如大批量数据写入),其他写入者会因为获取锁超时而失败
+   - **表现**: 报错 "Failed to acquire lock within timeout"
+   - **根因**: 默认锁超时时间(`hoodie.write.lock.wait.time.ms`)为 60 秒,大批量写入可能超过这个时间
+   - **解决**: 增大锁超时时间,或者使用 NBCC 模式
+
+2. **ZooKeeper 锁的网络分区问题**
+   - **问题**: 如果 ZooKeeper 集群发生网络分区,持有锁的客户端可能无法释放锁,导致其他写入者永久阻塞
+   - **表现**: 所有写入作业都卡在 "Waiting for lock" 状态
+   - **根因**: ZooKeeper 的 session 超时机制可能无法及时检测到客户端失联
+   - **解决**: 使用 DynamoDB Lock Provider(云环境)或 FileSystem Lock Provider(测试环境)
+
+3. **NBCC 模式的查询复杂度**
+   - **问题**: NBCC 模式允许多个写入者同时写入同一 FileGroup,导致同一 FileSlice 中有多个 Log Files,查询时需要合并所有 Log Files
+   - **表现**: 查询性能下降,尤其是在高并发写入场景
+   - **根因**: NBCC 将冲突解决推迟到查询时或 Compaction 时
+   - **解决**: 必须配置激进的 Compaction 策略,及时合并 Log Files
+
+4. **单写者模式的误用**
+   - **坑**: 在多个 Spark 作业同时运行的环境中使用 SINGLE_WRITER 模式,导致数据不一致
+   - **表现**: 查询结果中出现重复数据或数据丢失
+   - **根因**: SINGLE_WRITER 模式不做任何并发控制,完全依赖用户保证只有一个写入者
+   - **原则**: 只有在确保只有一个写入作业的场景下才使用 SINGLE_WRITER
+
+5. **文件系统锁的局限性**
+   - **问题**: FileSystemBasedLockProvider 依赖文件系统的原子性操作,但某些文件系统(如 S3)不保证原子性
+   - **表现**: 多个写入者可能同时获取到锁
+   - **解决**: 在生产环境中,S3 上必须使用 DynamoDBBasedLockProvider,HDFS 上可以使用 ZookeeperBasedLockProvider
+
+#### 3.6.3 核心概念解释
+
+**SINGLE_WRITER (单写者模式)**:
+- **并发控制**: 无锁,完全依赖用户保证只有一个写入者
+- **冲突检测**: 无
+- **适用场景**: 单一 Spark 作业、批处理 ETL、测试环境
+- **性能**: 最高(无锁开销)
+- **风险**: 如果误用(多写者同时运行),会导致数据不一致
+
+**OPTIMISTIC_CONCURRENCY_CONTROL (乐观并发控制)**:
+- **并发控制**: 基于分布式锁(ZooKeeper/DynamoDB/FileSystem)
+- **冲突检测**: 在 commit 阶段检测冲突,如果多个写入者写入同一 FileGroup,只有一个成功,其他回滚
+- **工作流程**:
+  1. 写入者获取锁
+  2. 执行写入操作(生成数据文件)
+  3. 检测冲突:读取 Timeline,判断是否有其他写入者已提交到相同 FileGroup
+  4. 如果无冲突,提交 commit;如果有冲突,回滚并重试
+  5. 释放锁
+- **适用场景**: 多个 Spark 作业、低频并发写入(每分钟级别)
+- **性能**: 中等(有锁开销,但冲突率低时性能可接受)
+- **源码**: `hudi-client/hudi-client-common/src/main/java/org/apache/hudi/client/transaction/lock/LockManager.java`
+
+**NON_BLOCKING_CONCURRENCY_CONTROL (非阻塞并发控制)**:
+- **并发控制**: 无锁,允许多个写入者同时写入同一 FileGroup
+- **冲突解决**: 推迟到查询时或 Compaction 时
+- **工作流程**:
+  1. 写入者直接写入 Log Files,无需获取锁
+  2. 多个写入者可能写入同一 FileSlice 的不同 Log Files
+  3. 查询时,读取所有 Log Files 并按时间戳合并
+  4. Compaction 时,将所有 Log Files 合并为一个 Parquet 文件
+- **适用场景**: 高频流式写入(秒级)、Flink CDC、Kafka 实时同步
+- **性能**: 写入性能最高(无锁),查询性能较低(需合并多个 Log Files)
+- **限制**: 仅支持 MOR 表
+
+**LockProvider 实现**:
+| 实现类 | 适用场景 | 优势 | 劣势 |
+|--------|---------|------|------|
+| `ZookeeperBasedLockProvider` | HDFS 环境 | 成熟稳定,支持分布式锁 | 需要额外的 ZooKeeper 集群 |
+| `DynamoDBBasedLockProvider` | AWS S3 环境 | 云原生,无需额外服务 | 仅限 AWS,有 API 调用成本 |
+| `FileSystemBasedLockProvider` | 测试环境 | 无需额外服务 | 不适合生产(某些文件系统不保证原子性) |
+| `InProcessLockProvider` | 单 JVM 测试 | 最简单 | 仅限单进程 |
+
+#### 3.6.4 设计理念
+
+**为什么这样设计**:
+
+1. **分层并发控制策略**
+   - Hudi 提供三种并发模式,让用户根据**写入频率**和**冲突概率**选择合适的策略
+   - SINGLE_WRITER: 无并发 → 最高性能
+   - OCC: 低频并发 → 平衡性能和一致性
+   - NBCC: 高频并发 → 最高写入吞吐,牺牲查询性能
+
+2. **乐观锁 vs 悲观锁的权衡**
+   - OCC 采用乐观锁思想:先执行,后检测冲突
+   - **优势**: 在冲突率低的场景下,避免了长时间持有锁,提高并发度
+   - **劣势**: 如果冲突率高,会导致大量回滚和重试,浪费计算资源
+   - Hudi 选择乐观锁是因为数据湖场景下,写入冲突率通常较低(不同作业写入不同分区)
+
+3. **NBCC 的创新设计**
+   - NBCC 是 Hudi 独有的并发控制模式,Delta Lake 和 Iceberg 都不支持
+   - **核心思想**: 将冲突解决从写入时推迟到读取时,类似 MVCC(Multi-Version Concurrency Control)
+   - **适用场景**: 流式数据模型,允许乱序、延迟数据,不要求强一致性
+   - **实现机制**: 利用 MOR 表的 Log Files,每个写入者写入独立的 Log File,查询时按时间戳合并
+
+4. **与其他系统的对比**
+   - **Delta Lake**: 仅支持 OCC,基于文件系统的原子性操作实现冲突检测
+   - **Iceberg**: 支持 OCC,基于 Snapshot 版本号实现冲突检测
+   - **Hudi 的优势**: 
+     - 支持 NBCC,适合高频流式写入
+     - 支持多种 LockProvider,适配不同的存储系统和云平台
+     - 冲突检测粒度更细(FileGroup 级别 vs Delta Lake 的分区级别)
+
+5. **锁的可插拔设计**
+   - `LockProvider` 接口允许用户自定义锁实现
+   - 源码位置: `hudi-common/src/main/java/org/apache/hudi/common/lock/LockProvider.java`
+   - 这种设计让 Hudi 可以适配不同的分布式协调服务(ZooKeeper/etcd/Consul)和云平台(AWS DynamoDB/GCP Firestore)
 
 ```
 WriteConcurrencyMode (hudi-common/src/main/java/org/apache/hudi/common/model/WriteConcurrencyMode.java)

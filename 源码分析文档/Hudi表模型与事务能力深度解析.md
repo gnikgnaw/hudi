@@ -29,6 +29,90 @@
 
 ## 1. Hudi 表模型概述
 
+### 1.0.1 解决什么问题
+
+**核心业务问题**：
+- **数据湖的更新难题**：传统数据湖（如纯 Parquet/ORC 文件）只支持追加写入，无法高效执行 UPDATE/DELETE 操作。如果要更新一条记录，需要重写整个分区甚至整个表，代价极高
+- **CDC 同步困境**：业务数据库的变更（增删改）需要实时同步到数据湖，传统方案只能全量覆盖或手动合并，无法做到增量更新
+- **数据新鲜度与查询性能的矛盾**：流式写入要求低延迟，但频繁写入小文件会严重影响查询性能；批量写入大文件查询快，但数据新鲜度差
+
+**如果没有 Hudi 会怎样**：
+- 每次更新都需要 Spark 全表扫描 + 重写，一个百亿级表的单条记录更新可能需要数小时
+- CDC 同步只能按天批量合并，实时性无法保证
+- 小文件问题失控，HDFS NameNode 压力巨大，查询性能急剧下降
+
+**实际应用场景**：
+- **用户画像实时更新**：用户行为日志实时写入数据湖，用户标签表需要秒级更新
+- **订单状态同步**：MySQL 订单表通过 Binlog CDC 实时同步到数据湖，订单状态变更需要原地更新
+- **GDPR 合规删除**：用户注销账号后，需要在数据湖中物理删除该用户的所有历史数据
+
+### 1.0.2 有什么坑
+
+**常见误区**：
+- **误以为 Hudi 是查询引擎**：Hudi 是表格式（Table Format），不是查询引擎。查询仍需 Spark/Flink/Presto/Trino 等引擎
+- **忽略索引的重要性**：不配置索引直接用 Hudi，upsert 性能可能比全表重写还差（因为需要全表扫描定位记录）
+- **混淆表类型**：COW 和 MOR 的选择直接影响读写性能，选错了会导致严重的性能问题
+
+**容易踩的坑**：
+- **分区字段选择不当**：分区过细导致小文件泛滥，分区过粗导致单分区过大影响并行度
+- **Record Key 设计错误**：Record Key 包含高基数字段（如时间戳）会导致索引膨胀
+- **忘记配置 Precombine Field**：使用 EVENT_TIME_ORDERING 模式时，如果不配置 precombine field 会导致合并逻辑错误
+
+**生产环境注意事项**：
+- **表版本升级不可逆**：Hudi 会自动升级表版本，但降级需要手动操作且有数据丢失风险
+- **Metadata Table 初始化代价高**：首次启用 Metadata Table 需要全表扫描构建索引，大表可能需要数小时
+- **Clean 策略配置不当导致数据丢失**：如果 `hoodie.cleaner.commits.retained` 设置过小，可能清理掉正在被长查询使用的文件
+
+### 1.0.3 核心概念解释
+
+**关键术语**：
+- **Table Format（表格式）**：定义数据文件的组织方式、元数据结构、读写协议的规范。Hudi/Iceberg/Delta Lake 都是表格式
+- **Lakehouse（湖仓一体）**：融合数据湖（低成本存储、Schema-on-Read）和数据仓库（ACID 事务、高性能查询）的架构
+- **Upsert**：Update + Insert 的合成词，如果记录存在则更新，不存在则插入
+- **FileGroup**：Hudi 数据组织的基本单元，一个 FileGroup 包含同一组记录的多个版本
+- **Timeline**：Hudi 的元数据核心，记录表上所有操作的有序历史
+
+**概念之间的关系**：
+```
+Hudi Table Format
+    ├── 数据层：FileGroup → FileSlice → BaseFile + LogFiles
+    ├── 元数据层：Timeline → HoodieInstant → Metadata Table
+    ├── 索引层：HoodieIndex → Record Key → FileGroup 映射
+    └── 服务层：Compaction / Clustering / Clean / Archival
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi | Iceberg | Delta Lake |
+|------|------|---------|------------|
+| 更新方式 | 索引定位 + 原地更新 | Copy-on-Write / MOR | Copy-on-Write / Deletion Vectors |
+| 元数据 | Timeline（有状态操作日志）| Snapshot 链（无状态快照）| Delta Log（事务日志）|
+| 索引 | 内置多种索引 | 依赖查询引擎 | 依赖查询引擎 |
+| 表服务 | 内置 Compaction/Clustering | 需要手动触发 | Optimize 命令 |
+
+### 1.0.4 设计理念
+
+**为什么这样设计**：
+- **索引优先**：Hudi 的核心理念是"通过索引将 Record Key 映射到 FileGroup"，这使得 upsert 可以精确定位到需要修改的文件，而不是全表扫描。这是 Hudi 与 Iceberg/Delta Lake 的根本区别
+- **引擎无关**：`HoodieTable<T, I, K, O>` 的泛型设计使得核心逻辑可以在 Spark/Flink/Java 之间共享，降低维护成本
+- **表服务内置**：Compaction/Clustering/Clean 等表维护操作内置在框架中，而不是依赖外部工具，确保数据质量
+
+**设计权衡**：
+- **写入复杂度 vs 查询性能**：Hudi 选择在写入时做更多工作（索引查找、文件合并），换取查询时的高性能
+- **元数据开销 vs 操作效率**：Timeline 和 Metadata Table 增加了元数据存储开销，但大幅提升了文件列表、统计信息的查询速度
+- **灵活性 vs 复杂性**：Hudi 提供了大量配置项（300+），灵活性极高但学习曲线陡峭
+
+**架构演进历史**：
+- **0.x 时代**：Timeline V1，基于 HoodieRecordPayload 的合并机制，单 Writer 模式
+- **1.0 里程碑**：Timeline V2（引入 completionTime），RecordMergeMode 取代 Payload，表版本升级到 8
+- **1.x 演进**：Metadata Table 成熟，Record Level Index，多级索引，NBCC 并发模式
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 更像"数据湖的 SQL 标准"，强调查询引擎集成；Hudi 更像"数据湖的更新引擎"，强调写入优化
+- **vs Delta Lake**：Delta Lake 与 Databricks 深度绑定，Hudi 是真正的引擎无关方案
+- **vs Hive**：Hive 是元数据管理 + 查询引擎，Hudi 是表格式 + 写入引擎，两者可以协同工作
+
+---
+
 Apache Hudi（Hadoop Upserts Deletes and Incrementals）是一个**数据湖仓平台（Lakehouse Platform）**，不仅仅是存储框架，它提供了：
 - **表格式（Table Format）**：定义数据文件的组织方式和元数据管理
 - **写入引擎**：支持 upsert、insert、delete、bulk_insert 等操作
@@ -72,6 +156,91 @@ HoodieFileGroup — 文件组（某个分区内数据的多版本容器）
 ---
 
 ## 2. 表类型详解
+
+### 2.0.1 解决什么问题
+
+**核心业务问题**：
+- **读写性能权衡**：不同业务场景对读写性能的要求差异巨大。实时数仓需要高频写入低延迟，OLAP 分析需要高吞吐查询性能，单一表类型无法同时满足
+- **存储成本与查询效率的矛盾**：频繁更新导致大量文件重写，存储放大严重；小文件合并不及时，查询性能急剧下降
+- **数据新鲜度分级需求**：某些查询需要最新数据（Snapshot Query），某些查询可以容忍一定延迟换取更高性能（Read Optimized Query）
+
+**如果没有表类型区分会怎样**：
+- 所有场景都用 COW：高频写入场景下，每次更新都重写整个 Parquet 文件，写放大严重，写入延迟不可接受
+- 所有场景都用 MOR：批量 ETL 场景下，查询需要合并大量 Log Files，查询性能下降，且需要维护额外的 Compaction 作业
+
+**实际应用场景**：
+- **COW 典型场景**：每日批量 ETL（T+1 数据仓库）、BI 报表查询、数据集市
+- **MOR 典型场景**：CDC 实时同步、用户行为日志流式写入、IoT 设备数据采集
+
+### 2.0.2 有什么坑
+
+**常见误区**：
+- **误以为 MOR 一定比 COW 快**：MOR 写入快但查询慢（需要合并 Log），如果查询频率远高于写入频率，COW 反而更优
+- **忽略 Compaction 的重要性**：MOR 表不配置 Compaction，Log Files 会无限堆积，最终导致查询超时甚至 OOM
+- **混淆 Snapshot 和 Read Optimized 查询**：MOR 表的 Read Optimized 查询只读 Base Files，看不到最新数据，很多用户误以为数据丢失
+
+**容易踩的坑**：
+- **COW 表的写放大陷阱**：单条记录更新导致重写 128MB Parquet 文件，写放大 128MB 倍。如果 FileGroup 过大（如 1GB），写放大更严重
+- **MOR 表的 Compaction 配置不当**：`hoodie.compact.inline.max.delta.commits` 设置过大，Log Files 堆积导致查询性能崩溃；设置过小，频繁 Compaction 影响写入吞吐
+- **查询引擎兼容性问题**：Presto/Trino 早期版本不支持 MOR 表的 Snapshot 查询，只能 Read Optimized，数据新鲜度无法保证
+
+**生产环境注意事项**：
+- **COW 表的小文件问题**：高频小批量写入会产生大量小 Parquet 文件，需要配置 Clustering 定期合并
+- **MOR 表的 Compaction 资源规划**：Compaction 是 CPU 和 I/O 密集型操作，需要独立的资源池，避免影响在线写入
+- **表类型不可变**：建表后无法从 COW 切换到 MOR（或反向），只能重建表
+
+### 2.0.3 核心概念解释
+
+**关键术语**：
+- **Base File**：列式存储文件（Parquet/ORC），包含完整的记录数据，支持向量化读取和列裁剪
+- **Log File**：行式存储文件（Avro 格式），只包含增量更新，需要与 Base File 合并后才能查询
+- **Compaction**：将 Base File + Log Files 合并为新的 Base File 的过程，MOR 表独有
+- **写放大（Write Amplification）**：实际写入的数据量 / 逻辑更新的数据量。COW 表写放大高，MOR 表写放大低
+- **读放大（Read Amplification）**：查询时需要读取的数据量 / 实际需要的数据量。MOR 表读放大高（需要合并 Log），COW 表读放大低
+
+**概念之间的关系**：
+```
+COW 表：
+  写入 → 重写 Base File → 查询直接读 Base File
+  写放大高 ↔ 读放大低
+
+MOR 表：
+  写入 → 追加 Log File → 查询合并 Base + Log
+  写放大低 ↔ 读放大高
+  
+  Compaction 周期性执行：
+    Base File + Log Files → 新 Base File
+    降低读放大，恢复查询性能
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi COW | Hudi MOR | Iceberg | Delta Lake |
+|------|----------|----------|---------|------------|
+| 更新方式 | 重写 Base File | 追加 Log File | 重写 Data File | 追加 + Deletion Vectors |
+| 查询视图 | 单一视图 | Snapshot / Read Optimized | 单一视图 | 单一视图 |
+| 合并机制 | 无需合并 | Compaction | 无需合并 | Optimize |
+
+### 2.0.4 设计理念
+
+**为什么这样设计**：
+- **读写分离的哲学**：COW 优化读（查询直接读 Parquet），MOR 优化写（追加 Log 无需重写）。这是经典的"空间换时间"与"时间换空间"的权衡
+- **查询视图分级**：MOR 表提供两种查询视图——Snapshot（最新数据，性能较低）和 Read Optimized（高性能，牺牲新鲜度）。这种设计让用户可以根据查询 SLA 选择合适的视图
+- **Compaction 作为后台服务**：MOR 表将写入和合并解耦，写入时只追加 Log，合并由独立的 Compaction 作业异步执行。这避免了写入路径的阻塞
+
+**设计权衡**：
+- **COW 的选择**：牺牲写入性能（重写整个文件），换取查询性能（直接读 Parquet，享受列式存储和向量化）
+- **MOR 的选择**：牺牲查询性能（需要合并 Log），换取写入性能（追加 Log 无需重写）
+- **为什么不支持表类型切换**：COW 和 MOR 的文件组织方式完全不同（COW 只有 Base File，MOR 有 Base + Log），切换需要重写所有数据，代价极高
+
+**架构演进历史**：
+- **0.x 早期**：只有 COW 表，MOR 表在 0.5.0 引入
+- **0.9.0 里程碑**：MOR 表的 Compaction 策略成熟，支持 Inline / Async / Schedule 三种模式
+- **1.x 演进**：引入 Log Compaction（只合并 Log Files，不生成新 Base File），进一步优化 MOR 表的写入性能
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 只有类似 COW 的模式（重写 Data File），没有类似 MOR 的增量追加机制
+- **vs Delta Lake**：Delta Lake 的 Deletion Vectors 类似 MOR 的思想（标记删除而非重写），但仍需要 Optimize 命令合并
+- **vs HBase**：HBase 的 LSM-Tree 与 MOR 表的 Base + Log 结构类似，但 HBase 是 KV 存储，Hudi 是列式存储
 
 ### 2.1 表类型定义
 
@@ -178,6 +347,93 @@ Compaction 后 (T4):
 
 ## 3. 文件组织核心模型
 
+### 3.0.1 解决什么问题
+
+**核心业务问题**：
+- **记录版本管理**：同一条记录可能被多次更新，如何高效存储和查询不同版本的数据？
+- **文件与记录的映射**：在分布式文件系统中，如何快速定位某条记录存储在哪个文件中？
+- **多版本并发读取**：如何支持 MVCC（多版本并发控制），让不同查询读取不同时间点的数据快照？
+
+**如果没有 FileGroup 模型会怎样**：
+- 每次更新都创建新文件，无法追踪同一组记录的版本演进，导致查询时需要全表扫描去重
+- 索引只能映射到具体文件，文件一旦重写，索引就失效，需要重建索引
+- 无法实现快照隔离，并发读写会相互干扰
+
+**实际应用场景**：
+- **增量查询**：查询 T1 到 T2 之间变更的记录，需要通过 FileGroup 的多版本 FileSlice 实现
+- **时间旅行查询**：查询某个历史时间点的数据快照，通过 FileGroup 的 baseInstantTime 定位
+- **并发写入冲突检测**：两个 Writer 修改同一个 FileGroup 会产生冲突，通过 FileGroup ID 检测
+
+### 3.0.2 有什么坑
+
+**常见误区**：
+- **误以为 FileGroup = 文件**：FileGroup 是逻辑概念，一个 FileGroup 包含多个版本的 FileSlice，每个 FileSlice 又包含 Base File + Log Files
+- **忽略 FileGroup 的不可变性**：FileGroup 的 fileId 在整个生命周期内不变，但其包含的 FileSlice 会随着写入不断增加
+- **混淆 FileSlice 的 baseInstantTime**：baseInstantTime 不是 FileSlice 的创建时间，而是该 FileSlice 对应的 Base File 的 commit time
+
+**容易踩的坑**：
+- **FileGroup 数量失控**：每次 INSERT 都会创建新的 FileGroup，如果不配置 Clustering，FileGroup 数量会无限增长，导致索引膨胀
+- **Log File 版本号理解错误**：Log File 的版本号是递增的，但 `logFiles` TreeSet 使用倒序排列（大版本号在前），扫描时需要注意顺序
+- **FileSlice 的 Base File 可能为空**：MOR 表的 FileSlice 可能只有 Log Files 没有 Base File（纯增量写入），查询时需要处理这种情况
+
+**生产环境注意事项**：
+- **FileGroup 大小控制**：通过 `hoodie.parquet.max.file.size` 控制 Base File 大小，过大会导致写放大，过小会导致小文件问题
+- **FileSlice 清理策略**：Clean 服务会清理旧版本的 FileSlice，但 `hoodie.cleaner.commits.retained` 设置不当会导致正在被查询的 FileSlice 被删除
+- **Metadata Table 的 FileGroup**：Metadata Table 本身也是 MOR 表，也有 FileGroup 结构，需要独立的 Compaction 策略
+
+### 3.0.3 核心概念解释
+
+**关键术语**：
+- **FileGroup**：Hudi 数据组织的基本单元，由 `partitionPath + fileId` 唯一标识，包含同一组记录的多个版本
+- **FileSlice**：FileGroup 在某个时间点的数据快照，由 `baseInstantTime` 标识，包含一个 Base File（可选）和多个 Log Files
+- **fileId**：FileGroup 的唯一标识符（UUID），在 FileGroup 的整个生命周期内不变
+- **baseInstantTime**：FileSlice 对应的 Base File 的 commit time，也是该 FileSlice 的版本标识
+- **writeToken**：写入任务的唯一标识，格式为 `taskPartitionId-stageId-taskAttemptId`，用于区分同一 instant 内的不同写入任务
+
+**概念之间的关系**：
+```
+HoodieTable
+  └── Partition (分区目录)
+      └── FileGroup (fileId 唯一标识)
+          ├── FileSlice @ T1 (baseInstantTime=T1)
+          │   ├── Base File: fileId_writeToken_T1.parquet
+          │   └── Log Files: .fileId_T1.log.1, .fileId_T1.log.2
+          ├── FileSlice @ T2 (baseInstantTime=T2, Compaction 后)
+          │   ├── Base File: fileId_writeToken_T2.parquet
+          │   └── Log Files: .fileId_T2.log.1
+          └── FileSlice @ T3 (baseInstantTime=T3)
+              └── Log Files: .fileId_T3.log.1 (只有 Log，无 Base)
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi FileGroup | Iceberg Data File | Delta Lake File | HBase Region |
+|------|----------------|-------------------|-----------------|--------------|
+| 版本管理 | 多版本 FileSlice | 单版本 Data File | 单版本 File | 多版本 Cell |
+| 文件组织 | Base + Log | 单一 Parquet | 单一 Parquet | HFile + MemStore |
+| 更新方式 | 追加 FileSlice | 重写 Data File | 追加 + DV | LSM-Tree 合并 |
+
+### 3.0.4 设计理念
+
+**为什么这样设计**：
+- **FileGroup 作为稳定锚点**：索引将 Record Key 映射到 FileGroup（而不是具体文件），这样即使文件被重写或合并，索引仍然有效。这是 Hudi 高效 upsert 的核心
+- **FileSlice 支持 MVCC**：每个 FileSlice 代表一个不可变的数据快照，查询可以选择任意时间点的 FileSlice，实现快照隔离
+- **TreeMap 倒序存储**：`HoodieFileGroup.fileSlices` 使用 TreeMap 倒序存储（最新的在前），这样 `getLatestFileSlice()` 是 O(1) 操作，优化了最常见的查询路径
+
+**设计权衡**：
+- **FileGroup 不可变 vs 灵活性**：fileId 一旦分配就不可变，这简化了索引维护，但也意味着无法动态调整 FileGroup 的分布（只能通过 Clustering 重新分配）
+- **Log File 版本号递增 vs 倒序存储**：Log File 版本号递增（1, 2, 3...），但 TreeSet 倒序存储（3, 2, 1），这种设计让最新的 Log 排在前面，优化了增量查询
+- **Base File 可选 vs 查询复杂度**：MOR 表的 FileSlice 允许没有 Base File（只有 Log），这降低了写入延迟，但增加了查询时的合并复杂度
+
+**架构演进历史**：
+- **0.x 早期**：FileGroup 只包含单个 Base File，没有 FileSlice 概念
+- **0.5.0 引入 MOR**：FileSlice 概念诞生，支持 Base + Log 的多版本结构
+- **1.x 演进**：FileSlice 支持纯 Log 模式（无 Base File），进一步优化写入性能
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 的 Data File 是单版本的，多版本通过 Snapshot 链管理，而 Hudi 的多版本在 FileGroup 内部管理
+- **vs Delta Lake**：Delta Lake 的 File 也是单版本的，多版本通过 Delta Log 管理，而 Hudi 的 FileGroup 是物理存储层面的多版本
+- **vs HBase**：HBase 的 Region 类似 FileGroup，但 HBase 是 KV 存储，Hudi 是列式存储，适用场景不同
+
 ### 3.1 HoodieFileGroup — 文件组
 
 **源码位置**: `hudi-common/src/main/java/org/apache/hudi/common/model/HoodieFileGroup.java`
@@ -267,6 +523,102 @@ FileGroup-A (fileId=fg-a):
 ---
 
 ## 4. 表元数据管理
+
+### 4.0.1 解决什么问题
+
+**核心业务问题**：
+- **文件列表查询性能**：数据湖表可能包含数百万个文件，每次查询都扫描文件系统获取文件列表，延迟不可接受
+- **统计信息缺失**：传统数据湖没有列统计信息（min/max/null count），查询优化器无法做数据跳过，导致全表扫描
+- **元数据一致性**：表配置、Schema、索引定义分散存储，如何保证元数据的原子更新和一致性？
+
+**如果没有 Metadata Table 会怎样**：
+- 每次查询都需要 LIST 文件系统，S3 上百万文件的 LIST 操作可能需要数分钟
+- 查询优化器无法做分区裁剪和数据跳过，查询性能下降 10-100 倍
+- 索引构建需要全表扫描，大表的索引构建可能需要数小时
+
+**实际应用场景**：
+- **快速查询规划**：Spark/Flink 查询前需要获取文件列表，Metadata Table 将 LIST 操作从秒级降低到毫秒级
+- **列统计加速**：通过 `column_stats` 分区，查询优化器可以跳过不满足条件的文件
+- **Record Level Index**：通过 `record_index` 分区，upsert 可以精确定位到记录所在的 FileGroup，避免 Bloom Filter 的误判
+
+### 4.0.2 有什么坑
+
+**常见误区**：
+- **误以为 Metadata Table 是必需的**：Metadata Table 是可选的，不启用也能正常工作，只是性能较低
+- **忽略 Metadata Table 的初始化成本**：首次启用 Metadata Table 需要全表扫描构建索引，大表可能需要数小时
+- **混淆 Metadata Table 和 Hive Metastore**：Metadata Table 是 Hudi 内部的元数据存储，Hive Metastore 是外部的元数据服务，两者独立
+
+**容易踩的坑**：
+- **Metadata Table 损坏**：如果 Metadata Table 与主表不一致（如手动删除文件），查询会返回错误结果。需要通过 `hoodie.metadata.enable=false` 禁用或重建
+- **Metadata Table 的 Compaction 配置**：Metadata Table 本身是 MOR 表，需要独立的 Compaction 策略，否则 Log Files 堆积会影响查询性能
+- **表版本升级时的兼容性**：低版本 Hudi 客户端无法读取高版本的 Metadata Table，混用版本会导致查询失败
+
+**生产环境注意事项**：
+- **Metadata Table 的存储开销**：Metadata Table 会占用额外的存储空间（通常是主表的 1-5%），需要纳入成本规划
+- **Metadata Table 的同步延迟**：Metadata Table 在主表 commit 后异步更新，极端情况下可能有短暂的不一致窗口
+- **多级索引的选择**：`column_stats`、`bloom_filters`、`record_index` 等分区按需启用，全部启用会增加写入开销
+
+### 4.0.3 核心概念解释
+
+**关键术语**：
+- **HoodieTableMetaClient**：表元数据的入口类，提供对 Timeline、TableConfig、IndexMetadata 的访问
+- **hoodie.properties**：表的不可变配置文件，包含表名、表类型、Record Key、分区字段等核心属性
+- **Metadata Table**：Hudi 内部的元数据表，本身也是一个 MOR 表，存储文件列表、列统计、Bloom Filter 等元数据
+- **Timeline Layout Version**：Timeline 文件的命名格式版本，V1 使用 `<instant>.<action>`，V2 使用 `<requested>_<completed>.<action>`
+- **HoodieTableVersion**：表版本号，当前最新为 9，控制表格式的兼容性
+
+**概念之间的关系**：
+```
+HoodieTableMetaClient (元数据入口)
+  ├── basePath (表根路径)
+  ├── metaPath (.hoodie/ 目录)
+  ├── HoodieTableConfig (hoodie.properties)
+  │   ├── 不可变属性：表名、表类型、Record Key、分区字段
+  │   └── 可变属性：表版本、Timeline Layout Version、Record Merge Mode
+  ├── HoodieActiveTimeline (活跃时间线)
+  │   └── timeline/ 目录下的 instant 文件
+  ├── HoodieArchivedTimeline (归档时间线)
+  │   └── archived/ 目录下的归档文件
+  ├── HoodieIndexMetadata (索引定义)
+  │   └── .index_defs/index.json
+  └── Metadata Table (元数据表)
+      ├── files/ (文件列表分区)
+      ├── column_stats/ (列统计分区)
+      ├── bloom_filters/ (Bloom Filter 分区)
+      └── record_index/ (Record Level Index 分区)
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi Metadata Table | Iceberg Metadata | Delta Lake Metadata | Hive Metastore |
+|------|---------------------|------------------|---------------------|----------------|
+| 存储位置 | 表内（.hoodie/metadata/）| 表内（metadata/）| 表内（_delta_log/）| 外部数据库 |
+| 存储格式 | MOR 表 | Avro 文件 | JSON 文件 | MySQL/PostgreSQL |
+| 文件列表 | files 分区 | Manifest 文件 | Add/Remove 操作 | Hive Partition |
+| 列统计 | column_stats 分区 | Manifest 内嵌 | Delta Log 内嵌 | 需要 ANALYZE |
+
+### 4.0.4 设计理念
+
+**为什么这样设计**：
+- **Metadata Table 作为 MOR 表**：元数据更新频繁（每次 commit 都更新），使用 MOR 表可以低延迟追加更新，避免重写整个元数据文件
+- **分区化的元数据**：不同类型的元数据（文件列表、列统计、索引）存储在不同的分区，按需加载，避免读取不需要的元数据
+- **Timeline Layout V2**：将 completionTime 编码到文件名中，避免读取文件内容才能获取完成时间，大幅提升 Timeline 扫描性能
+
+**设计权衡**：
+- **Metadata Table 的存储开销 vs 查询性能**：Metadata Table 占用额外存储（1-5%），但将文件列表查询从秒级降低到毫秒级，这是值得的权衡
+- **同步更新 vs 异步更新**：Metadata Table 在主表 commit 后同步更新（在同一事务中），保证强一致性，但会增加 commit 延迟
+- **表版本自动升级 vs 兼容性**：Hudi 会自动升级表版本到最新，享受新特性，但低版本客户端无法读取高版本表，需要统一升级
+
+**架构演进历史**：
+- **0.x 早期**：没有 Metadata Table，每次查询都 LIST 文件系统
+- **0.7.0 引入 Metadata Table**：只有 `files` 分区，存储文件列表
+- **0.10.0 扩展**：新增 `column_stats` 和 `bloom_filters` 分区
+- **1.0 里程碑**：Timeline Layout V2，表版本升级到 8
+- **1.x 演进**：新增 `record_index`、`partition_stats`、二级索引、表达式索引等分区
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 的 Metadata 存储在 Manifest 文件中，每次 commit 都重写 Manifest，而 Hudi 使用 MOR 表追加更新，写入更高效
+- **vs Delta Lake**：Delta Lake 的 Metadata 存储在 Delta Log 中，是 JSON 文件，而 Hudi 使用 Parquet + Avro，存储更紧凑
+- **vs Hive Metastore**：Hive Metastore 是外部服务，需要独立部署和维护，而 Hudi Metadata Table 是表内存储，无需额外服务
 
 ### 4.1 HoodieTableMetaClient 核心类
 
@@ -385,6 +737,100 @@ public enum HoodieTableVersion {
 
 ## 5. Timeline 时间线机制
 
+### 5.0.1 解决什么问题
+
+**核心业务问题**：
+- **操作历史追踪**：数据湖表经历了哪些写入、合并、清理操作？如何审计和回溯？
+- **事务原子性保证**：如何确保写入操作要么完全成功，要么完全失败，不会出现中间状态？
+- **增量数据消费**：下游系统如何高效地只消费新增或变更的数据，而不是全表扫描？
+- **因果一致性问题**：多个并发写入操作，如何保证消费者按照正确的顺序消费数据？
+
+**如果没有 Timeline 会怎样**：
+- 无法知道表的操作历史，出现问题时无法回溯和排查
+- 写入失败后无法清理残留文件，导致数据不一致
+- 增量查询需要全表扫描比对，性能不可接受
+- 并发写入时，消费者可能遗漏数据或重复消费
+
+**实际应用场景**：
+- **增量 ETL**：下游数据仓库只消费 T1 到 T2 之间的变更数据，通过 Timeline 的 instant 范围查询实现
+- **时间旅行查询**：查询某个历史时间点的数据快照，通过 Timeline 定位该时间点的 commit
+- **故障恢复**：写入失败后，通过 Timeline 的 INFLIGHT 状态识别未完成的操作，触发 Rollback
+
+### 5.0.2 有什么坑
+
+**常见误区**：
+- **误以为 requestedTime 就是数据的时间**：requestedTime 是操作的请求时间，不是数据的业务时间（业务时间在 precombine field 中）
+- **忽略 completionTime 的重要性**：V1 Timeline 只有 requestedTime，V2 新增 completionTime，增量消费必须按 completionTime 排序才能保证因果一致性
+- **混淆 Active Timeline 和 Archived Timeline**：Active Timeline 只保留最近的 N 次操作，历史操作会归档到 Archived Timeline
+
+**容易踩的坑**：
+- **Archival 配置不当导致数据丢失**：`hoodie.keep.min.commits` 设置过小，可能归档掉正在被增量查询使用的 commit，导致查询失败
+- **INFLIGHT 状态的 instant 未清理**：写入失败后，INFLIGHT 状态的 instant 文件残留，需要手动或通过 Rollback 清理
+- **Timeline 文件过多导致性能下降**：如果不启用 Archival，Timeline 文件会无限增长，扫描 Timeline 的性能会急剧下降
+
+**生产环境注意事项**：
+- **Timeline Layout V1 vs V2 的兼容性**：低版本客户端无法读取 V2 格式的 Timeline，混用版本会导致查询失败
+- **Archival 的触发时机**：Archival 默认在 Clean 之后触发，如果禁用 Clean，需要手动触发 Archival
+- **Timeline 的并发访问**：多个 Writer 并发访问 Timeline 时，需要通过锁保证一致性
+
+### 5.0.3 核心概念解释
+
+**关键术语**：
+- **Timeline**：Hudi 的核心元数据抽象，记录表上所有操作的有序历史，是一个有状态的操作日志
+- **HoodieInstant**：Timeline 上的一个时间点，代表一次操作，包含 state（状态）、action（操作类型）、requestedTime（请求时间）、completionTime（完成时间）
+- **Active Timeline**：活跃时间线，存储在 `.hoodie/timeline/` 目录，包含最近的 N 次操作
+- **Archived Timeline**：归档时间线，存储在 `.hoodie/archived/` 目录，包含历史操作
+- **Instant State**：操作状态，包括 REQUESTED（已请求）、INFLIGHT（执行中）、COMPLETED（已完成）
+
+**概念之间的关系**：
+```
+HoodieTimeline (时间线抽象)
+  ├── HoodieActiveTimeline (活跃时间线)
+  │   ├── 最近 N 次操作（受 Archival 配置控制）
+  │   ├── 高频访问
+  │   └── 文件位置：.hoodie/timeline/
+  └── HoodieArchivedTimeline (归档时间线)
+      ├── 历史操作归档
+      ├── 低频访问（时间旅行、审计查询）
+      └── 文件位置：.hoodie/archived/
+
+HoodieInstant (时间点)
+  ├── state: REQUESTED → INFLIGHT → COMPLETED
+  ├── action: commit / deltacommit / compaction / clean / rollback / ...
+  ├── requestedTime: 操作请求时间（唯一标识）
+  └── completionTime: 操作完成时间（V2 新增，用于因果一致性）
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi Timeline | Iceberg Snapshot | Delta Lake Delta Log | HBase WAL |
+|------|---------------|------------------|----------------------|-----------|
+| 本质 | 有状态操作日志 | 无状态快照链 | 事务日志 | 预写日志 |
+| 状态转换 | REQUESTED → INFLIGHT → COMPLETED | 无状态 | 无状态 | 无状态 |
+| 因果一致性 | completionTime（V2）| Snapshot ID | Transaction ID | Sequence ID |
+| 归档机制 | Archival | Snapshot Expiration | Checkpoint | WAL Rotation |
+
+### 5.0.4 设计理念
+
+**为什么这样设计**：
+- **有状态的操作日志**：Timeline 不仅记录操作结果（COMPLETED），还记录操作过程（REQUESTED、INFLIGHT），这使得 Hudi 可以检测和恢复失败的操作
+- **completionTime 解决因果一致性**：V2 Timeline 引入 completionTime，解决了并发写入时的因果一致性问题——消费者按 completionTime 排序，不会遗漏数据
+- **Active + Archived 双层结构**：Active Timeline 保留最近的操作（高频访问），Archived Timeline 保留历史操作（低频访问），平衡了性能和存储成本
+
+**设计权衡**：
+- **状态转换的开销 vs 可靠性**：每次状态转换都需要文件操作（创建/重命名），增加了写入延迟，但保证了操作的原子性和可追溯性
+- **Timeline 文件数量 vs 查询性能**：Timeline 文件越多，扫描越慢，但归档太激进会导致历史查询失败。通过 `hoodie.keep.min.commits` 和 `hoodie.keep.max.commits` 平衡
+- **V1 vs V2 的兼容性 vs 性能**：V2 将 completionTime 编码到文件名，提升了性能，但牺牲了与 V1 的兼容性
+
+**架构演进历史**：
+- **0.x 早期**：Timeline V1，只有 requestedTime，文件名格式为 `<instant>.<action>`
+- **1.0 里程碑**：Timeline V2，新增 completionTime，文件名格式为 `<requested>_<completed>.<action>`，解决因果一致性问题
+- **1.x 演进**：Timeline 支持多级索引，通过 Metadata Table 加速 Timeline 扫描
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 的 Snapshot 是无状态的，每个 Snapshot 是独立的快照，而 Hudi 的 Timeline 是有状态的，记录操作的完整生命周期
+- **vs Delta Lake**：Delta Lake 的 Delta Log 类似 Timeline，但 Delta Log 是无状态的事务日志，而 Hudi 的 Timeline 有状态转换
+- **vs HBase**：HBase 的 WAL 是预写日志，用于故障恢复，而 Hudi 的 Timeline 是操作历史，用于增量查询和审计
+
 ### 5.1 Timeline 概念
 
 Timeline 是 Hudi 的核心元数据抽象，记录表上所有操作的有序历史。与 Iceberg 的 Snapshot 链和 Delta Lake 的 Delta Log 不同，Hudi 的 Timeline 是一个**有状态的操作日志**——每个操作都有 REQUESTED → INFLIGHT → COMPLETED 的状态转换。
@@ -493,6 +939,94 @@ Archived Timeline (.hoodie/archived/)
 
 ## 6. Record Merge 机制
 
+### 6.0.1 解决什么问题
+
+**核心业务问题**：
+- **乱序数据合并**：Kafka 消费到的数据可能乱序（网络延迟、分区重平衡），如何保证最终一致性？
+- **部分字段更新**：某些场景只更新记录的部分字段，如何合并新旧记录？
+- **CDC 数据同步**：数据库 Binlog 同步到数据湖，如何处理 INSERT/UPDATE/DELETE 操作？
+
+**如果没有 Record Merge 机制会怎样**：
+- 乱序数据会导致旧数据覆盖新数据，数据不一致
+- 部分字段更新需要先读取旧记录再合并，性能低下
+- CDC 同步无法正确处理删除操作
+
+**实际应用场景**：
+- **Kafka 流式写入**：Kafka 消息乱序到达，通过 EVENT_TIME_ORDERING 按事件时间合并
+- **用户画像更新**：用户标签表的部分字段更新，通过 CUSTOM 模式实现字段级合并
+- **MySQL Binlog 同步**：通过 COMMIT_TIME_ORDERING 按 Binlog 顺序合并
+
+### 6.0.2 有什么坑
+
+**常见误区**：
+- **误以为 COMMIT_TIME_ORDERING 按数据时间排序**：COMMIT_TIME_ORDERING 按事务提交时间排序，不是数据的业务时间
+- **忽略 precombine field 的重要性**：EVENT_TIME_ORDERING 模式必须配置 precombine field，否则合并逻辑错误
+- **混淆 RecordMergeMode 和 HoodieRecordPayload**：1.x 引入 RecordMergeMode 取代 Payload，但旧表仍使用 Payload
+
+**容易踩的坑**：
+- **precombine field 类型不匹配**：precombine field 必须是可比较类型（数值、时间戳、字符串），如果是复杂类型会导致合并失败
+- **CUSTOM 模式的性能陷阱**：自定义 RecordMerger 如果实现不当，会导致严重的性能下降
+- **Payload 迁移到 RecordMergeMode**：旧表升级到 1.x 后，需要手动配置 RecordMergeMode，否则会使用推断的默认值
+
+**生产环境注意事项**：
+- **precombine field 的选择**：选择单调递增的字段（如时间戳、版本号），避免使用业务字段（如金额、状态）
+- **CUSTOM 模式的测试**：自定义 RecordMerger 需要充分测试，确保合并逻辑正确
+- **Payload 的兼容性**：如果使用了自定义 Payload，升级到 1.x 后需要迁移到 RecordMerger
+
+### 6.0.3 核心概念解释
+
+**关键术语**：
+- **RecordMergeMode**：记录合并模式，包括 COMMIT_TIME_ORDERING（按事务时间）、EVENT_TIME_ORDERING（按事件时间）、CUSTOM（自定义）
+- **precombine field**：用于 EVENT_TIME_ORDERING 模式的排序字段，通常是时间戳或版本号
+- **RecordMerger**：记录合并器，实现具体的合并逻辑
+- **HoodieRecordPayload**：旧版的记录合并机制（< 1.0），通过 preCombine() 和 combineAndGetUpdateValue() 实现
+
+**概念之间的关系**：
+```
+RecordMergeMode (合并模式)
+  ├── COMMIT_TIME_ORDERING (按事务时间)
+  │   └── 后提交的记录覆盖先提交的记录
+  ├── EVENT_TIME_ORDERING (按事件时间)
+  │   ├── 使用 precombine field 排序
+  │   └── 事件时间大的记录覆盖事件时间小的记录
+  └── CUSTOM (自定义)
+      └── 用户实现 RecordMerger 接口
+
+旧版 Payload 映射:
+  DefaultHoodieRecordPayload → EVENT_TIME_ORDERING
+  OverwriteWithLatestAvroPayload → COMMIT_TIME_ORDERING
+  自定义 Payload → CUSTOM
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi RecordMergeMode | Iceberg Merge | Delta Lake Merge | Flink CDC |
+|------|----------------------|---------------|------------------|-----------|
+| 合并策略 | 按时间 / 自定义 | 按条件 | 按条件 | 按操作类型 |
+| 乱序处理 | EVENT_TIME_ORDERING | 不支持 | 不支持 | 支持 |
+| 部分更新 | CUSTOM | MERGE INTO | MERGE | 不支持 |
+
+### 6.0.4 设计理念
+
+**为什么这样设计**：
+- **三种模式覆盖主要场景**：COMMIT_TIME_ORDERING 适合 CDC，EVENT_TIME_ORDERING 适合流式写入，CUSTOM 适合复杂业务逻辑
+- **precombine field 解耦业务逻辑**：通过配置 precombine field，而不是硬编码合并逻辑，提高了灵活性
+- **RecordMerger 取代 Payload**：Payload 机制过于复杂（需要实现多个方法），RecordMerger 更简洁
+
+**设计权衡**：
+- **简单性 vs 灵活性**：COMMIT_TIME_ORDERING 和 EVENT_TIME_ORDERING 简单易用，CUSTOM 灵活但复杂
+- **性能 vs 功能**：COMMIT_TIME_ORDERING 性能最高（无需比较 precombine field），EVENT_TIME_ORDERING 功能更强（支持乱序）
+- **兼容性 vs 简洁性**：保留 Payload 机制是为了兼容旧表，但增加了代码复杂度
+
+**架构演进历史**：
+- **0.x 时代**：只有 HoodieRecordPayload 机制，用户需要实现 preCombine() 和 combineAndGetUpdateValue()
+- **1.0 里程碑**：引入 RecordMergeMode，简化了合并逻辑的配置
+- **1.x 演进**：自动推断旧表的合并配置，平滑迁移
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 的 MERGE INTO 是 SQL 层面的合并，而 Hudi 的 RecordMergeMode 是存储层面的合并
+- **vs Delta Lake**：Delta Lake 的 MERGE 也是 SQL 层面的，而 Hudi 的合并是自动的（写入时触发）
+- **vs Flink CDC**：Flink CDC 按操作类型（INSERT/UPDATE/DELETE）合并，而 Hudi 按时间或自定义逻辑合并
+
 ### 6.1 RecordMergeMode（1.x 新特性）
 
 **源码位置**: `hudi-common/src/main/java/org/apache/hudi/common/config/RecordMergeMode.java`
@@ -540,6 +1074,101 @@ public enum RecordMergeMode {
 ---
 
 ## 7. 事务管理机制
+
+### 7.0.1 解决什么问题
+
+**核心业务问题**：
+- **写入原子性**：如何保证写入操作要么完全成功，要么完全失败，不会出现部分成功的中间状态？
+- **并发写入冲突**：多个 Writer 同时写入同一张表，如何避免数据损坏和不一致？
+- **故障恢复**：写入过程中 Writer 崩溃，如何清理残留文件和恢复一致性？
+
+**如果没有事务管理会怎样**：
+- 写入失败后残留大量数据文件，导致存储浪费和查询错误
+- 并发写入时，两个 Writer 可能覆盖对方的数据，导致数据丢失
+- 故障恢复需要手动清理，运维成本高
+
+**实际应用场景**：
+- **批量 ETL**：Spark 作业写入数据湖，如果作业失败，需要自动回滚已写入的文件
+- **流式写入**：Flink 作业持续写入，如果 Checkpoint 失败，需要回滚到上一个一致性状态
+- **多管道写入**：多个 DeltaStreamer 实例并发写入不同分区，需要避免冲突
+
+### 7.0.2 有什么坑
+
+**常见误区**：
+- **误以为 Hudi 支持跨表事务**：Hudi 的事务是表级的，不支持跨表的 ACID 事务
+- **忽略锁的重要性**：多 Writer 场景必须配置分布式锁，否则会出现数据不一致
+- **混淆 Rollback 和 Restore**：Rollback 回滚单次失败操作，Restore 回滚到 Savepoint 时间点
+
+**容易踩的坑**：
+- **锁超时配置不当**：`hoodie.write.lock.wait_time_ms` 设置过小，导致写入频繁失败；设置过大，导致写入阻塞时间过长
+- **心跳超时导致误判**：Writer 心跳超时被误判为崩溃，其他 Writer 触发 Rollback，导致正常写入被回滚
+- **Metadata Table 同步失败**：主表 commit 成功但 Metadata Table 更新失败，导致元数据不一致
+
+**生产环境注意事项**：
+- **锁的高可用**：ZooKeeper / DynamoDB 等锁服务的高可用性直接影响写入的可用性
+- **事务超时配置**：长时间运行的写入操作（如大批量 INSERT）需要调整锁超时时间
+- **Rollback 的性能影响**：Rollback 需要删除大量文件，如果文件系统性能差，Rollback 可能需要很长时间
+
+### 7.0.3 核心概念解释
+
+**关键术语**：
+- **TransactionManager**：事务管理器，负责获取锁、冲突检测、提交和回滚
+- **LockManager**：锁管理器，封装了锁的获取、释放和重试逻辑
+- **ACID**：原子性（Atomicity）、一致性（Consistency）、隔离性（Isolation）、持久性（Durability）
+- **MVCC**：多版本并发控制，通过 FileGroup 的多版本 FileSlice 实现快照隔离
+- **OCC**：乐观并发控制，写入时不持锁，提交时检测冲突
+
+**概念之间的关系**：
+```
+事务管理体系:
+  TransactionManager (事务管理器)
+    ├── LockManager (锁管理器)
+    │   └── LockProvider (锁提供者)
+    │       ├── InProcessLockProvider (单 Writer)
+    │       ├── ZookeeperBasedLockProvider (多 Writer)
+    │       └── DynamoDBBasedLockProvider (AWS)
+    ├── ConflictResolutionStrategy (冲突解决策略)
+    │   └── SimpleConcurrentFileWritesConflictResolutionStrategy
+    └── EarlyConflictDetectionStrategy (早期冲突检测)
+        ├── DirectMarkerBasedDetectionStrategy
+        └── TimelineServerBasedDetectionStrategy
+
+ACID 保证:
+  Atomicity → Timeline 状态转换 (INFLIGHT → COMPLETED)
+  Consistency → Metadata Table 同步更新
+  Isolation → MVCC + OCC
+  Durability → 分布式文件系统持久化
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi | Iceberg | Delta Lake | PostgreSQL |
+|------|------|---------|------------|------------|
+| 事务范围 | 表级 | 表级 | 表级 | 数据库级 |
+| 并发控制 | OCC + 锁 | OCC | OCC + DynamoDB | MVCC + 锁 |
+| 隔离级别 | 快照隔离 | 快照隔离 | 快照隔离 | 可配置 |
+| 锁机制 | 可插拔 | Catalog 锁 | DynamoDB | 内置锁 |
+
+### 7.0.4 设计理念
+
+**为什么这样设计**：
+- **OCC 而非悲观锁**：数据湖写入操作持续时间长（分钟到小时级），悲观锁会导致严重的阻塞，OCC 在低冲突场景下性能更优
+- **Timeline 状态转换保证原子性**：INFLIGHT → COMPLETED 的状态转换是原子操作（文件重命名），保证了事务的原子性
+- **可插拔的锁机制**：不同部署环境有不同的锁服务（ZooKeeper / DynamoDB / Hive Metastore），通过 LockProvider 接口适配
+
+**设计权衡**：
+- **OCC 的冲突重试 vs 悲观锁的阻塞**：OCC 在高冲突场景下会导致大量重试和浪费，但在低冲突场景下性能远超悲观锁
+- **同步更新 Metadata Table vs 异步更新**：同步更新保证强一致性，但增加 commit 延迟；异步更新降低延迟，但可能出现短暂不一致
+- **锁的粒度**：Hudi 使用表级锁（而非分区级或 FileGroup 级），简化了实现，但降低了并发度
+
+**架构演进历史**：
+- **0.x 早期**：单 Writer 模式，无锁机制
+- **0.7.0 引入多 Writer**：引入 LockManager 和 ConflictResolutionStrategy
+- **1.x 演进**：引入 NBCC（非阻塞并发控制），支持同一 FileGroup 的并发写入
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 依赖 Catalog 提供锁（如 Hive Metastore Lock），而 Hudi 的锁机制更灵活（可插拔）
+- **vs Delta Lake**：Delta Lake 在 Databricks 上使用 DynamoDB 锁，开源版本使用文件系统锁，而 Hudi 支持多种锁实现
+- **vs 传统数据库**：传统数据库使用 MVCC + 行级锁，而 Hudi 使用 MVCC + 表级锁（粒度更粗）
 
 ### 7.1 TransactionManager
 
@@ -632,6 +1261,99 @@ BaseHoodieWriteClient.upsert()
 ---
 
 ## 8. 并发控制与冲突解决
+
+### 8.0.1 解决什么问题
+
+**核心业务问题**：
+- **并发写入冲突检测**：多个 Writer 同时修改同一个 FileGroup，如何检测冲突？
+- **冲突解决策略**：检测到冲突后，是直接失败还是尝试自动解决？
+- **性能与正确性平衡**：冲突检测的粒度（表级/分区级/FileGroup 级）如何选择？
+
+**如果没有冲突解决机制会怎样**：
+- 两个 Writer 同时修改同一个 FileGroup，后提交者会覆盖前者的数据，导致数据丢失
+- 无法支持多 Writer 并发写入，只能串行化所有写入操作，吞吐量低
+- 故障恢复时无法判断哪些操作需要回滚
+
+**实际应用场景**：
+- **多管道并发写入**：多个 DeltaStreamer 实例并发写入不同分区，需要检测是否修改了相同的 FileGroup
+- **Compaction 与写入并发**：Compaction 作业与写入作业并发执行，需要检测是否操作了相同的 FileGroup
+- **Schema Evolution 冲突**：两个 Writer 同时修改 Schema，需要检测 Schema 冲突
+
+### 8.0.2 有什么坑
+
+**常见误区**：
+- **误以为冲突检测是实时的**：冲突检测发生在 commit 阶段（Pre-commit），而不是写入阶段
+- **忽略早期冲突检测的重要性**：只依赖 commit 阶段的冲突检测，可能导致大量写入工作浪费
+- **混淆冲突检测和早期冲突检测**：ConflictResolutionStrategy 是 commit 阶段的冲突解决，EarlyConflictDetectionStrategy 是写入阶段的早期检测
+
+**容易踩的坑**：
+- **冲突检测范围配置不当**：`getCandidateInstants()` 返回的候选 instant 范围过大，导致冲突检测性能下降
+- **FileGroup 级冲突检测的误判**：两个 Writer 修改同一分区的不同 FileGroup，不应该冲突，但如果实现不当可能误判
+- **Compaction 冲突处理**：Compaction 与写入操作的冲突处理逻辑复杂，容易出错
+
+**生产环境注意事项**：
+- **冲突重试策略**：检测到冲突后，Writer 应该重试还是直接失败？需要根据业务场景配置
+- **冲突检测的性能开销**：冲突检测需要读取候选 instant 的元数据，如果候选范围过大，性能开销显著
+- **Metadata Table 的冲突检测**：Metadata Table 本身也需要冲突检测，但逻辑更复杂（因为是 MOR 表）
+
+### 8.0.3 核心概念解释
+
+**关键术语**：
+- **ConflictResolutionStrategy**：冲突解决策略接口，定义了冲突检测和解决的逻辑
+- **ConcurrentOperation**：并发操作抽象，包含操作类型、修改的文件列表等信息
+- **Candidate Instants**：候选冲突 instant，即从 lastSuccessfulInstant 到当前 Timeline 最新之间的已完成 instant
+- **FileGroup 级冲突**：两个操作修改了相同的 FileGroup，是最常见的冲突类型
+- **Schema 冲突**：两个操作修改了 Schema，需要特殊处理
+
+**概念之间的关系**：
+```
+冲突检测流程:
+  1. 获取候选 Instant
+     getCandidateInstants(lastSuccessful, current)
+     → 返回 [lastSuccessful, Timeline.latest] 之间的已完成 instant
+  
+  2. 构建 ConcurrentOperation
+     对每个候选 instant，读取其修改的文件列表
+     → ConcurrentOperation(instant, fileGroups)
+  
+  3. 检测冲突
+     hasConflict(thisOp, otherOp)
+     → 检查 FileGroup ID 是否有交集
+  
+  4. 解决冲突
+     resolveConflict(thisOp, otherOp)
+     → 通常直接抛出 HoodieWriteConflictException
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi | Iceberg | Delta Lake | PostgreSQL |
+|------|------|---------|------------|------------|
+| 冲突检测粒度 | FileGroup 级 | File 级 | File 级 | 行级 |
+| 冲突检测时机 | Pre-commit | Pre-commit | Pre-commit | 实时 |
+| 冲突解决策略 | 可插拔 | 固定 | 固定 | 固定 |
+| 早期冲突检测 | Marker 机制 | 无 | 无 | 锁机制 |
+
+### 8.0.4 设计理念
+
+**为什么这样设计**：
+- **FileGroup 级冲突检测**：Hudi 的索引将 Record Key 映射到 FileGroup，所以冲突检测的自然粒度是 FileGroup 级，而不是文件级或记录级
+- **可插拔的冲突解决策略**：不同场景有不同的冲突解决需求（如 Bucket Index 的冲突解决逻辑与普通索引不同），通过接口抽象提高灵活性
+- **Pre-commit 冲突检测**：在 commit 阶段检测冲突，而不是写入阶段，这是 OCC 的核心思想——写入时不持锁，提交时检测冲突
+
+**设计权衡**：
+- **冲突检测粒度 vs 并发度**：FileGroup 级冲突检测粒度较粗，降低了并发度，但简化了实现。如果使用记录级冲突检测，实现复杂度会大幅增加
+- **Pre-commit 检测 vs 实时检测**：Pre-commit 检测延迟了冲突发现的时机，可能导致写入工作浪费，但避免了写入阶段的锁竞争
+- **冲突直接失败 vs 自动解决**：Hudi 的默认策略是检测到冲突直接失败（抛出异常），而不是尝试自动解决，这简化了实现，但增加了用户的重试负担
+
+**架构演进历史**：
+- **0.x 早期**：单 Writer 模式，无冲突检测
+- **0.7.0 引入多 Writer**：引入 ConflictResolutionStrategy 接口
+- **1.x 演进**：新增 BucketIndexConcurrentFileWritesConflictResolutionStrategy，支持 Bucket Index 的并发写入
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 的冲突检测是文件级的，通过比较 Manifest 中的文件列表检测冲突
+- **vs Delta Lake**：Delta Lake 的冲突检测也是文件级的，通过比较 Delta Log 中的 Add/Remove 操作检测冲突
+- **vs 传统数据库**：传统数据库使用行级锁或 MVCC，冲突检测是实时的，而 Hudi 是 Pre-commit 检测
 
 ### 8.1 ConflictResolutionStrategy 接口
 
@@ -727,6 +1449,96 @@ OCC:    write → lock → conflict_check → commit → unlock
 
 ## 9. 锁机制实现
 
+### 9.0.1 解决什么问题
+
+**核心业务问题**：
+- **多 Writer 互斥**：多个 Writer 同时提交事务，如何保证只有一个 Writer 能成功提交？
+- **分布式环境下的锁**：Writer 可能分布在不同的机器上，如何实现分布式锁？
+- **锁的高可用性**：锁服务故障时，如何保证写入的可用性？
+
+**如果没有锁机制会怎样**：
+- 多个 Writer 同时提交，Timeline 文件可能被覆盖，导致元数据损坏
+- 冲突检测无法保证原子性，可能出现检测通过但提交失败的情况
+- 无法支持多 Writer 并发写入
+
+**实际应用场景**：
+- **多 DeltaStreamer 实例**：多个 DeltaStreamer 实例并发写入同一张表，需要通过锁保证提交的串行化
+- **Compaction 与写入并发**：Compaction 作业与写入作业并发执行，需要通过锁保证元数据更新的原子性
+- **跨集群写入**：不同 Spark 集群的作业写入同一张表，需要通过外部锁服务（如 ZooKeeper）协调
+
+### 9.0.2 有什么坑
+
+**常见误区**：
+- **误以为锁是必需的**：单 Writer 场景不需要分布式锁，使用 InProcessLockProvider 即可
+- **忽略锁的性能开销**：获取和释放锁需要网络通信，会增加 commit 延迟
+- **混淆锁和冲突检测**：锁保证提交的串行化，冲突检测保证数据的一致性，两者是独立的机制
+
+**容易踩的坑**：
+- **锁超时配置不当**：`hoodie.write.lock.wait_time_ms` 设置过小，导致写入频繁失败；设置过大，导致写入阻塞时间过长
+- **锁服务故障导致写入不可用**：ZooKeeper / DynamoDB 故障时，所有写入都会失败
+- **锁泄漏**：Writer 崩溃后未释放锁，导致其他 Writer 无法获取锁（需要依赖锁的超时机制）
+
+**生产环境注意事项**：
+- **锁服务的高可用**：ZooKeeper / DynamoDB 需要部署高可用集群
+- **锁的超时时间**：需要根据写入操作的持续时间调整锁超时时间
+- **锁的监控**：监控锁的获取失败率、等待时间等指标，及时发现问题
+
+### 9.0.3 核心概念解释
+
+**关键术语**：
+- **LockManager**：锁管理器，封装了锁的获取、释放和重试逻辑
+- **LockProvider**：锁提供者接口，定义了锁的获取和释放方法
+- **InProcessLockProvider**：JVM 内锁，使用 ReentrantReadWriteLock 实现，适用于单 Writer 场景
+- **ZookeeperBasedLockProvider**：基于 ZooKeeper 的分布式锁，适用于多 Writer 场景
+- **DynamoDBBasedLockProvider**：基于 AWS DynamoDB 的分布式锁，适用于 AWS 环境
+
+**概念之间的关系**：
+```
+LockManager (锁管理器)
+  ├── LockConfiguration (锁配置)
+  │   ├── hoodie.write.lock.provider (锁提供者类名)
+  │   ├── hoodie.write.lock.wait_time_ms (等待时间)
+  │   └── hoodie.write.lock.num_retries (重试次数)
+  └── LockProvider (锁提供者)
+      ├── InProcessLockProvider (单 Writer)
+      │   └── ReentrantReadWriteLock
+      ├── ZookeeperBasedLockProvider (多 Writer)
+      │   └── ZooKeeper InterProcessMutex
+      ├── DynamoDBBasedLockProvider (AWS)
+      │   └── DynamoDB 条件写入
+      └── 自定义 LockProvider
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi | Iceberg | Delta Lake | ZooKeeper |
+|------|------|---------|------------|-----------|
+| 锁机制 | 可插拔 | Catalog 锁 | DynamoDB 锁 | 原生分布式锁 |
+| 锁粒度 | 表级 | 表级 | 表级 | 自定义 |
+| 锁类型 | 互斥锁 | 互斥锁 | 互斥锁 | 互斥锁/读写锁 |
+| 高可用 | 依赖锁服务 | 依赖 Catalog | 依赖 DynamoDB | ZK 集群 |
+
+### 9.0.4 设计理念
+
+**为什么这样设计**：
+- **可插拔的锁机制**：不同部署环境有不同的锁服务（ZooKeeper / DynamoDB / Hive Metastore），通过 LockProvider 接口适配，提高了灵活性
+- **懒加载 LockProvider**：LockProvider 使用 volatile 懒加载，避免单 Writer 场景下的不必要初始化
+- **重试机制**：LockManager 内置重试逻辑，避免因网络抖动导致的锁获取失败
+
+**设计权衡**：
+- **表级锁 vs 分区级锁**：Hudi 使用表级锁，简化了实现，但降低了并发度。如果使用分区级锁，实现复杂度会大幅增加
+- **锁的超时时间 vs 写入延迟**：锁的超时时间过短，会导致写入频繁失败；过长，会导致写入阻塞时间过长
+- **锁服务的依赖 vs 可用性**：依赖外部锁服务（如 ZooKeeper）提高了并发能力，但也引入了额外的故障点
+
+**架构演进历史**：
+- **0.x 早期**：只有 InProcessLockProvider，不支持多 Writer
+- **0.7.0 引入多 Writer**：引入 LockProvider 接口，支持 ZooKeeper 锁
+- **1.x 演进**：新增 DynamoDBBasedLockProvider，支持 AWS 环境
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 依赖 Catalog 提供锁（如 Hive Metastore Lock），而 Hudi 的锁机制更灵活（可插拔）
+- **vs Delta Lake**：Delta Lake 在 Databricks 上使用 DynamoDB 锁，开源版本使用文件系统锁，而 Hudi 支持多种锁实现
+- **vs ZooKeeper**：ZooKeeper 提供原生的分布式锁，而 Hudi 通过 LockProvider 接口封装了 ZooKeeper 锁
+
 ### 9.1 LockManager
 
 **源码位置**: `hudi-client/hudi-client-common/src/main/java/org/apache/hudi/client/transaction/lock/LockManager.java`
@@ -801,6 +1613,96 @@ hoodie.write.lock.num_retries=3            # 获取锁失败重试次数
 ---
 
 ## 10. 早期冲突检测
+
+### 10.0.1 解决什么问题
+
+**核心业务问题**：
+- **OCC 的延迟冲突发现**：OCC 的冲突检测发生在 commit 阶段，如果写入操作持续数小时，在最终 commit 时才发现冲突会浪费大量计算资源
+- **写入过程中的冲突预警**：如何在写入过程中就发现潜在冲突，及早终止写入操作？
+- **Marker 文件的管理**：如何高效地创建、查询和清理 Marker 文件？
+
+**如果没有早期冲突检测会怎样**：
+- 大批量写入操作（如数小时的 bulk insert）在最终 commit 时才发现冲突，浪费大量计算资源和时间
+- 多个 Writer 并发写入时，无法及早发现冲突，导致大量无效写入
+- 故障恢复时，无法快速识别哪些文件需要清理
+
+**实际应用场景**：
+- **大批量 ETL**：Spark 作业写入数 TB 数据，如果在写入过程中发现冲突，可以及早终止，避免浪费数小时的计算
+- **流式写入**：Flink 作业持续写入，通过 Marker 文件检测其他 Writer 的并发写入，及早发现冲突
+- **故障恢复**：Writer 崩溃后，通过 Marker 文件快速识别需要清理的数据文件
+
+### 10.0.2 有什么坑
+
+**常见误区**：
+- **误以为早期冲突检测是必需的**：早期冲突检测是可选的，不启用也能正常工作，只是可能浪费计算资源
+- **忽略 Marker 文件的性能开销**：在 S3 等对象存储上，大量 Marker 文件的创建和查询代价高昂
+- **混淆 Marker 机制和早期冲突检测**：Marker 机制用于追踪写入的文件，早期冲突检测是 Marker 的一个应用场景
+
+**容易踩的坑**：
+- **DIRECT Marker 在 S3 上的性能问题**：DIRECT 策略在 S3 上创建大量小文件，LIST 操作代价极高
+- **Timeline Server 的可用性**：TIMELINE_SERVER_BASED 策略依赖 Timeline Server，如果 Timeline Server 故障，早期冲突检测会失效
+- **Marker 文件未清理**：写入失败后，Marker 文件可能残留，需要通过 Rollback 清理
+
+**生产环境注意事项**：
+- **Marker 策略的选择**：S3 等对象存储上使用 TIMELINE_SERVER_BASED，HDFS 上使用 DIRECT
+- **Timeline Server 的部署**：TIMELINE_SERVER_BASED 策略需要部署 Timeline Server
+- **Marker 文件的监控**：监控 Marker 文件的数量和大小，及时发现异常
+
+### 10.0.3 核心概念解释
+
+**关键术语**：
+- **Early Conflict Detection**：早期冲突检测，在写入过程中检测潜在冲突，而不是等到 commit 阶段
+- **Marker 文件**：标记写入操作创建的数据文件，用于 Rollback 和早期冲突检测
+- **EarlyConflictDetectionStrategy**：早期冲突检测策略接口，定义了冲突检测的逻辑
+- **DirectMarkerBasedDetectionStrategy**：直接在文件系统上创建 Marker 文件进行冲突检测
+- **TimelineServerBasedDetectionStrategy**：通过 Timeline Server 集中管理 Marker 进行冲突检测
+
+**概念之间的关系**：
+```
+早期冲突检测体系:
+  EarlyConflictDetectionStrategy (早期冲突检测策略)
+    ├── DirectMarkerBasedDetectionStrategy (直接 Marker)
+    │   ├── 每个 Writer 直接在文件系统上创建 Marker 文件
+    │   ├── 优点：实现简单，无需中心化服务
+    │   └── 缺点：S3 上性能差（大量小文件）
+    └── TimelineServerBasedDetectionStrategy (Timeline Server Marker)
+        ├── 通过 Timeline Server 集中管理 Marker
+        ├── 优点：减少文件系统操作，性能高
+        └── 缺点：依赖 Timeline Server 可用性
+
+Marker 文件命名:
+  .hoodie/.temp/<instantTime>/<partitionPath>/<fileName>.marker.<IOType>
+  IOType: CREATE / MERGE / APPEND
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi Early Conflict Detection | Iceberg | Delta Lake | PostgreSQL |
+|------|-------------------------------|---------|------------|------------|
+| 早期冲突检测 | Marker 机制 | 无 | 无 | 锁机制 |
+| 检测时机 | 写入过程中 | Commit 阶段 | Commit 阶段 | 实时 |
+| 实现方式 | Marker 文件 | 无 | 无 | 行级锁 |
+
+### 10.0.4 设计理念
+
+**为什么这样设计**：
+- **Marker 文件作为写入追踪**：Marker 文件不仅用于早期冲突检测，还用于 Rollback 时识别需要清理的文件，一举两得
+- **两种 Marker 策略**：DIRECT 策略适合 HDFS（小文件不是问题），TIMELINE_SERVER_BASED 策略适合 S3（减少文件系统操作）
+- **可选的早期冲突检测**：早期冲突检测是可选的，不启用也能正常工作，给用户选择的灵活性
+
+**设计权衡**：
+- **早期检测 vs 性能开销**：早期冲突检测增加了 Marker 文件的创建和查询开销，但可以避免大量无效写入
+- **DIRECT vs TIMELINE_SERVER_BASED**：DIRECT 实现简单但性能差，TIMELINE_SERVER_BASED 性能高但依赖外部服务
+- **Marker 文件的清理时机**：Marker 文件在 commit 成功后清理，如果 commit 失败，需要通过 Rollback 清理
+
+**架构演进历史**：
+- **0.x 早期**：只有 DIRECT Marker 策略
+- **0.9.0 引入 Timeline Server**：引入 TIMELINE_SERVER_BASED 策略，优化 S3 上的性能
+- **1.x 演进**：Marker 机制与早期冲突检测解耦，Marker 成为独立的写入追踪机制
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 没有早期冲突检测机制，冲突检测只在 commit 阶段
+- **vs Delta Lake**：Delta Lake 也没有早期冲突检测机制
+- **vs 传统数据库**：传统数据库使用锁机制实现实时冲突检测，而 Hudi 使用 Marker 文件实现早期冲突检测
 
 ### 10.1 为什么需要早期冲突检测？
 
@@ -888,6 +1790,96 @@ Writer 崩溃:    .hoodie/.heartbeat/<instantTime> (文件超时)
 
 ## 12. WriteConcurrencyMode 写并发模式深度解析
 
+### 12.0.1 解决什么问题
+
+**核心业务问题**：
+- **并发写入的性能与正确性权衡**：单 Writer 性能最高但无法并发，多 Writer 支持并发但需要冲突检测和锁，如何选择？
+- **同一 FileGroup 的并发写入**：传统 OCC 模式下，两个 Writer 修改同一个 FileGroup 会冲突，如何支持同一 FileGroup 的并发写入？
+- **写入模式的灵活配置**：不同业务场景对并发的需求不同，如何提供灵活的配置？
+
+**如果没有并发模式区分会怎样**：
+- 所有场景都使用多 Writer 模式，单 Writer 场景也需要锁和冲突检测，性能浪费
+- 无法支持同一 FileGroup 的并发写入，限制了并发度
+- 配置复杂，用户难以选择合适的并发模式
+
+**实际应用场景**：
+- **SINGLE_WRITER**：单一 DeltaStreamer 实例写入，批量 ETL 作业
+- **OPTIMISTIC_CONCURRENCY_CONTROL**：多个 DeltaStreamer 实例并发写入不同分区
+- **NON_BLOCKING_CONCURRENCY_CONTROL**：多个数据源并发写入同一记录的不同字段（部分列更新）
+
+### 12.0.2 有什么坑
+
+**常见误区**：
+- **误以为 NBCC 适用所有场景**：NBCC 只适用于 MOR 表 + Simple Bucket Index，其他场景会导致数据不一致
+- **忽略 OCC 的冲突重试成本**：OCC 模式下，冲突概率高时会导致大量重试和浪费
+- **混淆并发模式和锁配置**：并发模式控制冲突检测策略，锁配置控制提交的串行化，两者是独立的
+
+**容易踩的坑**：
+- **NBCC 的限制条件**：NBCC 必须使用 MOR 表 + Simple Bucket Index，否则会导致数据不一致
+- **OCC 的 LAZY Clean 策略**：OCC 模式下，Clean 策略会自动设置为 LAZY，避免误删其他 Writer 的 INFLIGHT 文件
+- **并发模式的切换**：并发模式切换需要重启所有 Writer，否则可能出现不一致
+
+**生产环境注意事项**：
+- **并发模式的选择**：根据业务场景选择合适的并发模式，不要盲目使用 NBCC
+- **OCC 的冲突监控**：监控 OCC 模式下的冲突率，如果冲突率过高，考虑优化分区策略或使用 NBCC
+- **NBCC 的 Compaction 策略**：NBCC 模式下，Compaction 需要处理多个 Writer 的并发写入，配置需要更谨慎
+
+### 12.0.3 核心概念解释
+
+**关键术语**：
+- **WriteConcurrencyMode**：写并发模式枚举，包括 SINGLE_WRITER、OPTIMISTIC_CONCURRENCY_CONTROL、NON_BLOCKING_CONCURRENCY_CONTROL
+- **SINGLE_WRITER**：单 Writer 模式，同一时刻只有一个 Writer 写入，无需锁和冲突检测
+- **OPTIMISTIC_CONCURRENCY_CONTROL（OCC）**：乐观并发控制，多个 Writer 并发写入，提交时检测冲突
+- **NON_BLOCKING_CONCURRENCY_CONTROL（NBCC）**：非阻塞并发控制，多个 Writer 可以并发写入同一个 FileGroup，冲突由读取端和 Compaction 解决
+
+**概念之间的关系**：
+```
+WriteConcurrencyMode (写并发模式)
+  ├── SINGLE_WRITER (单 Writer)
+  │   ├── 无需锁（InProcessLockProvider）
+  │   ├── 无需冲突检测
+  │   └── 性能最高
+  ├── OPTIMISTIC_CONCURRENCY_CONTROL (OCC)
+  │   ├── 需要分布式锁（ZooKeeper / DynamoDB）
+  │   ├── 需要冲突检测（FileGroup 级）
+  │   ├── Clean 策略自动设置为 LAZY
+  │   └── 适用于低冲突场景
+  └── NON_BLOCKING_CONCURRENCY_CONTROL (NBCC)
+      ├── 需要分布式锁
+      ├── 无需冲突检测（允许同一 FileGroup 并发写入）
+      ├── 限制条件：MOR 表 + Simple Bucket Index
+      └── 冲突由读取端和 Compaction 解决
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi SINGLE_WRITER | Hudi OCC | Hudi NBCC | Iceberg | Delta Lake |
+|------|-------------------|----------|-----------|---------|------------|
+| 并发度 | 单 Writer | 多 Writer（不同 FileGroup）| 多 Writer（同一 FileGroup）| 多 Writer | 多 Writer |
+| 冲突检测 | 无 | FileGroup 级 | 无 | File 级 | File 级 |
+| 锁机制 | 无需 | 需要 | 需要 | Catalog 锁 | DynamoDB 锁 |
+
+### 12.0.4 设计理念
+
+**为什么这样设计**：
+- **默认 SINGLE_WRITER**：大部分数据湖场景并不需要多 Writer 并发写入，默认单 Writer 模式去掉了锁和冲突检测的开销，最大化性能
+- **OCC 适用低冲突场景**：数据湖写入操作持续时间长，冲突概率通常较低（不同管道写不同分区），OCC 在低冲突场景下接近无锁的性能
+- **NBCC 突破 FileGroup 限制**：传统 OCC 模式下，同一 FileGroup 只能串行写入，NBCC 通过 MOR 表的 Log File 追加机制，支持同一 FileGroup 的并发写入
+
+**设计权衡**：
+- **SINGLE_WRITER 的简单性 vs 并发度**：SINGLE_WRITER 最简单，但无法并发；OCC 支持并发，但需要锁和冲突检测
+- **OCC 的冲突重试 vs NBCC 的读取复杂度**：OCC 在高冲突场景下会导致大量重试，NBCC 避免了冲突，但增加了读取端的合并复杂度
+- **NBCC 的限制条件 vs 通用性**：NBCC 只适用于 MOR 表 + Simple Bucket Index，限制了通用性，但在特定场景下性能最优
+
+**架构演进历史**：
+- **0.x 早期**：只有 SINGLE_WRITER 模式
+- **0.7.0 引入多 Writer**：引入 OPTIMISTIC_CONCURRENCY_CONTROL 模式
+- **1.x 演进**：引入 NON_BLOCKING_CONCURRENCY_CONTROL 模式，支持同一 FileGroup 的并发写入
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 只有类似 OCC 的模式，不支持 NBCC
+- **vs Delta Lake**：Delta Lake 也只有类似 OCC 的模式
+- **vs 传统数据库**：传统数据库使用行级锁，而 Hudi 使用表级锁 + FileGroup 级冲突检测
+
 ### 12.1 枚举定义与源码位置
 
 **源码位置**: `hudi-common/src/main/java/org/apache/hudi/common/model/WriteConcurrencyMode.java`
@@ -945,6 +1937,109 @@ if (writeConcurrencyMode.supportsMultiWriter()) {
 ---
 
 ## 13. HoodieWriteConfig 的建造者模式与配置系统设计哲学
+
+### 13.0.1 解决什么问题
+
+**核心业务问题**：
+- **配置项爆炸**：Hudi 有 300+ 个配置项，如何组织和管理这些配置？
+- **配置演进与兼容性**：配置项需要重命名、废弃、新增，如何保证向后兼容？
+- **配置校验与文档**：如何保证配置的合法性？如何自动生成配置文档？
+
+**如果没有配置系统会怎样**：
+- 配置项散落在代码各处，难以维护和查找
+- 配置重命名会破坏向后兼容性，用户升级困难
+- 配置文档与代码不同步，用户配置错误
+
+**实际应用场景**：
+- **配置分组**：将 300+ 配置项按领域分组（Index / Compaction / Clean / Clustering），降低认知负担
+- **配置兼容性**：旧配置键名通过 altKeys 机制保留，用户升级无需修改配置
+- **配置推断**：根据其他配置自动推断当前配置值，减少用户配置工作
+
+### 13.0.2 有什么坑
+
+**常见误区**：
+- **误以为所有配置都需要设置**：大部分配置有合理的默认值，只需设置核心配置
+- **忽略配置的废弃警告**：使用废弃的配置键名会打印警告，但功能正常，用户容易忽略
+- **混淆配置的推断和默认值**：推断值优先于默认值，如果推断逻辑错误，会导致配置不符合预期
+
+**容易踩的坑**：
+- **配置键名拼写错误**：配置键名拼写错误不会报错，会使用默认值，导致配置不生效
+- **配置的依赖关系**：某些配置依赖其他配置，如果依赖配置未设置，会导致配置不生效
+- **配置的优先级**：配置可以从多个来源加载（代码 / 配置文件 / 环境变量），优先级不清楚会导致配置混乱
+
+**生产环境注意事项**：
+- **配置的版本管理**：配置文件应纳入版本管理，方便回滚和审计
+- **配置的监控**：监控关键配置的值，及时发现配置错误
+- **配置的文档**：维护配置文档，说明每个配置的作用和推荐值
+
+### 13.0.3 核心概念解释
+
+**关键术语**：
+- **ConfigProperty**：配置属性抽象，包含配置键名、默认值、文档、版本信息、合法值、推断函数等
+- **altKeys（alternatives）**：替代键名，用于配置重命名时的向后兼容
+- **inferFunction**：推断函数，根据其他配置自动推断当前配置值
+- **HoodieWriteConfig**：写入配置类，包含所有写入相关的配置
+- **Builder 模式**：建造者模式，用于构建复杂的配置对象
+
+**概念之间的关系**：
+```
+配置系统体系:
+  ConfigProperty (配置属性)
+    ├── key (配置键名)
+    ├── defaultValue (默认值)
+    ├── doc (文档描述)
+    ├── sinceVersion (引入版本)
+    ├── deprecatedVersion (废弃版本)
+    ├── validValues (合法值集合)
+    ├── alternatives (替代键名，用于兼容性)
+    └── inferFunction (推断函数，用于自动推断)
+
+  HoodieWriteConfig (写入配置)
+    ├── HoodieIndexConfig (索引配置)
+    ├── HoodieCompactionConfig (Compaction 配置)
+    ├── HoodieCleanConfig (Clean 配置)
+    ├── HoodieClusteringConfig (Clustering 配置)
+    ├── HoodieMetricsConfig (指标配置)
+    ├── HoodieLockConfig (锁配置)
+    └── ... (20+ 个子配置域)
+
+  Builder 模式:
+    HoodieWriteConfig.Builder
+      ├── withXxx() 方法设置配置
+      ├── fromProperties() 从 Properties 批量导入
+      ├── setDefaults() 设置默认值
+      └── build() 构建配置对象
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi ConfigProperty | Spring Boot @ConfigurationProperties | Hadoop Configuration | Flink ConfigOption |
+|------|---------------------|--------------------------------------|----------------------|-------------------|
+| 元信息 | 完整（版本/文档/合法值）| 部分（文档）| 无 | 部分（文档）|
+| 兼容性 | altKeys 机制 | 无 | 无 | Deprecated 注解 |
+| 推断 | inferFunction | 无 | 无 | 无 |
+| 分组 | 子配置域 | @ConfigurationProperties | 无 | ConfigOptions 类 |
+
+### 13.0.4 设计理念
+
+**为什么这样设计**：
+- **配置即文档**：ConfigProperty 将配置的元信息（文档、版本、合法值）与配置本身绑定，配置文档可以从代码自动生成，避免文档与代码不同步
+- **altKeys 保证兼容性**：配置重命名时，旧键名作为 alternative 保留，用户使用旧键名时打印警告但功能正常，降低了版本升级的摩擦
+- **inferFunction 减少配置工作**：根据其他配置自动推断当前配置值，减少用户的配置工作，降低配置错误的概率
+
+**设计权衡**：
+- **配置的灵活性 vs 复杂性**：Hudi 提供了 300+ 配置项，灵活性极高但学习曲线陡峭。通过 Builder 模式和子配置域分组，降低了复杂性
+- **配置的推断 vs 显式设置**：推断机制减少了配置工作，但也增加了理解成本（用户需要理解推断逻辑）
+- **配置的兼容性 vs 代码复杂度**：altKeys 机制保证了兼容性，但增加了配置读取的复杂度
+
+**架构演进历史**：
+- **0.x 早期**：配置项散落在代码各处，没有统一的配置系统
+- **0.7.0 引入 ConfigProperty**：引入 ConfigProperty 抽象，统一配置管理
+- **1.x 演进**：引入 inferFunction 机制，支持配置自动推断
+
+**与业界方案对比**：
+- **vs Spring Boot**：Spring Boot 的 @ConfigurationProperties 提供了类型安全的配置绑定，但缺少版本信息和兼容性机制
+- **vs Hadoop Configuration**：Hadoop Configuration 是简单的 key-value 存储，缺少元信息和校验
+- **vs Flink ConfigOption**：Flink ConfigOption 提供了文档和默认值，但缺少兼容性机制和推断功能
 
 ### 13.1 ConfigProperty 核心抽象
 
@@ -1071,6 +2166,103 @@ protected void setDefaults() {
 
 ## 14. HoodieTable 的子类体系（完整继承树）
 
+### 14.0.1 解决什么问题
+
+**核心业务问题**：
+- **引擎无关的核心逻辑**：Hudi 支持 Spark / Flink / Java 三种引擎，如何共享核心逻辑，避免重复实现？
+- **表类型的差异化实现**：COW 和 MOR 表的写入逻辑不同，如何组织代码结构？
+- **引擎特定的优化**：不同引擎有不同的 API 和优化策略，如何在共享核心逻辑的同时支持引擎特定优化？
+
+**如果没有清晰的继承体系会怎样**：
+- 核心逻辑在 Spark / Flink / Java 中重复实现，维护成本高
+- COW 和 MOR 的代码混在一起，难以理解和维护
+- 引擎特定优化难以实现，性能受限
+
+**实际应用场景**：
+- **新功能开发**：新功能优先在 HoodieTable 基类中实现，自动支持所有引擎
+- **引擎特定优化**：Spark 的向量化读取、Flink 的流式写入等优化在引擎特定子类中实现
+- **表类型扩展**：新增表类型（如未来可能的 Append-Only 表）只需继承 HoodieTable 基类
+
+### 14.0.2 有什么坑
+
+**常见误区**：
+- **误以为 MOR 和 COW 是平行关系**：MOR 继承 COW，而不是平行关系，因为 MOR 是 COW 的超集
+- **忽略泛型参数的含义**：HoodieTable 的四个泛型参数（T, I, K, O）是引擎抽象的关键，理解泛型参数才能理解继承体系
+- **混淆 HoodieTable 和 HoodieTableMetaClient**：HoodieTable 是操作抽象（写入、表服务），HoodieTableMetaClient 是元数据入口
+
+**容易踩的坑**：
+- **在引擎特定子类中实现通用逻辑**：通用逻辑应该在 HoodieTable 基类中实现，而不是在 Spark / Flink / Java 子类中重复实现
+- **MOR 子类覆盖 COW 方法时未调用 super**：MOR 继承 COW，覆盖方法时需要注意是否需要调用 super
+- **泛型参数类型不匹配**：引擎特定子类的泛型参数必须与引擎的数据结构匹配（如 Spark 使用 HoodieData，Flink 使用 List）
+
+**生产环境注意事项**：
+- **引擎版本兼容性**：不同引擎版本的 API 可能不兼容，需要维护多个版本特定的子类
+- **性能优化的权衡**：引擎特定优化可以提升性能，但增加了代码复杂度和维护成本
+- **新引擎的支持**：新增引擎支持需要实现完整的继承树（引擎抽象层 + COW + MOR）
+
+### 14.0.3 核心概念解释
+
+**关键术语**：
+- **HoodieTable<T, I, K, O>**：表操作抽象基类，四个泛型参数分别代表 Record Payload 类型、Input 类型、Key 类型、Output 类型
+- **HoodieSparkTable**：Spark 引擎抽象层，泛型参数绑定为 HoodieData
+- **HoodieFlinkTable**：Flink 引擎抽象层，泛型参数绑定为 List
+- **HoodieJavaTable**：纯 Java 引擎抽象层，泛型参数绑定为 List
+- **HoodieSparkCopyOnWriteTable**：Spark COW 表实现
+- **HoodieSparkMergeOnReadTable**：Spark MOR 表实现，继承 COW
+
+**概念之间的关系**：
+```
+继承体系:
+  HoodieTable<T, I, K, O> (引擎无关基类)
+    ├── 核心逻辑：Index / Partitioner / ActionExecutor
+    ├── 抽象方法：upsert / insert / delete / compact
+    └── 工厂方法：create(metaClient, config, context)
+
+  HoodieSparkTable<T> (Spark 引擎层)
+    ├── 泛型绑定：I=HoodieData<HoodieRecord<T>>, K=HoodieData<HoodieKey>, O=HoodieData<WriteStatus>
+    ├── Spark 特定优化：向量化读取、RDD 操作
+    └── 工厂方法：create(metaClient, config, sparkContext)
+
+  HoodieSparkCopyOnWriteTable<T> (Spark COW 实现)
+    ├── 实现 upsert：HoodieMergeHandle 重写 Base File
+    ├── 实现 insert：HoodieCreateHandle 创建新 Base File
+    └── 实现表服务：Clean / Rollback / Savepoint
+
+  HoodieSparkMergeOnReadTable<T> (Spark MOR 实现)
+    ├── 继承 COW：复用 Clean / Rollback / Savepoint
+    ├── 覆盖 upsert：HoodieAppendHandle 追加 Log File
+    └── 新增 compact：合并 Base + Log
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi HoodieTable | Iceberg Table | Delta Lake DeltaLog | Spark DataFrame |
+|------|------------------|---------------|---------------------|-----------------|
+| 引擎抽象 | 泛型参数 | 无（依赖引擎）| 无（依赖引擎）| 引擎绑定 |
+| 表类型 | COW / MOR 继承 | 单一实现 | 单一实现 | 无 |
+| 引擎支持 | Spark / Flink / Java | 多引擎 | Spark / Flink | Spark |
+
+### 14.0.4 设计理念
+
+**为什么这样设计**：
+- **泛型参数实现引擎抽象**：通过四个泛型参数（T, I, K, O），核心逻辑可以用统一的接口编写，只有涉及分布式计算框架的 API 时才需要引擎特定实现
+- **MOR 继承 COW**：MOR 是 COW 的超集（MOR 的 INSERT 可以和 COW 一样），继承关系最大化了代码复用
+- **工厂方法创建子类**：通过工厂方法根据表类型（COW / MOR）和引擎类型（Spark / Flink / Java）创建对应的子类，简化了对象创建
+
+**设计权衡**：
+- **继承 vs 组合**：Hudi 选择继承（MOR 继承 COW），而不是组合，这简化了代码结构，但也增加了继承层次的复杂度
+- **引擎抽象 vs 性能**：泛型参数实现引擎抽象，但也增加了类型转换的开销（虽然很小）
+- **代码复用 vs 灵活性**：共享核心逻辑提高了代码复用，但也限制了引擎特定优化的灵活性
+
+**架构演进历史**：
+- **0.x 早期**：只有 Spark 实现，没有引擎抽象
+- **0.7.0 引入 Flink**：引入 HoodieTable 泛型抽象，支持 Flink 引擎
+- **1.x 演进**：引入 Java 引擎，完善引擎抽象体系
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 没有引擎抽象层，核心逻辑依赖引擎的 API
+- **vs Delta Lake**：Delta Lake 与 Spark 深度绑定，没有引擎抽象
+- **vs Hive**：Hive 是查询引擎，而 Hudi 是表格式，两者不可比
+
 ### 14.1 继承树全景
 
 **源码位置**: `hudi-client/hudi-client-common/src/main/java/org/apache/hudi/table/HoodieTable.java`
@@ -1160,6 +2352,104 @@ MOR 表继承 COW 表而不是并列平行，原因是：
 ---
 
 ## 15. Marker 机制深度解析
+
+### 15.0.1 解决什么问题
+
+**核心业务问题**：
+- **写入文件追踪**：一次写入操作可能创建数千个数据文件，如何追踪这些文件？
+- **Rollback 文件清理**：写入失败后，如何快速识别需要清理的文件，而不是扫描整个文件系统？
+- **早期冲突检测**：如何在写入过程中就发现两个 Writer 修改了相同的 FileGroup？
+
+**如果没有 Marker 机制会怎样**：
+- Rollback 需要扫描整个文件系统找出需要删除的文件，性能极差
+- 无法实现早期冲突检测，只能在 commit 阶段检测冲突
+- 数据一致性难以保证，未 commit 的数据文件可能被误读
+
+**实际应用场景**：
+- **大批量写入的 Rollback**：Spark 作业写入数 TB 数据失败，通过 Marker 文件快速识别需要清理的数千个数据文件
+- **多 Writer 早期冲突检测**：两个 Writer 并发写入，通过 Marker 文件在写入过程中就发现冲突
+- **故障恢复**：Writer 崩溃后，通过 Marker 文件识别残留的数据文件并清理
+
+### 15.0.2 有什么坑
+
+**常见误区**：
+- **误以为 Marker 文件是数据文件**：Marker 文件只是标记，不包含实际数据
+- **忽略 Marker 文件的性能开销**：在 S3 等对象存储上，大量 Marker 文件的创建和查询代价高昂
+- **混淆 Marker 类型**：DIRECT 和 TIMELINE_SERVER_BASED 两种类型的性能特征完全不同
+
+**容易踩的坑**：
+- **DIRECT Marker 在 S3 上的性能问题**：DIRECT 策略在 S3 上创建大量小文件，LIST 操作代价极高，可能导致写入超时
+- **Timeline Server 的可用性**：TIMELINE_SERVER_BASED 策略依赖 Timeline Server，如果 Timeline Server 故障，Marker 创建会失败
+- **Marker 文件未清理**：写入失败后，Marker 文件可能残留在 `.hoodie/.temp/` 目录，需要定期清理
+
+**生产环境注意事项**：
+- **Marker 策略的选择**：S3 等对象存储上必须使用 TIMELINE_SERVER_BASED，HDFS 上使用 DIRECT
+- **Timeline Server 的部署**：TIMELINE_SERVER_BASED 策略需要部署 Timeline Server，增加了运维复杂度
+- **Marker 文件的监控**：监控 `.hoodie/.temp/` 目录的大小，及时发现 Marker 文件泄漏
+
+### 15.0.3 核心概念解释
+
+**关键术语**：
+- **Marker 文件**：标记写入操作创建的数据文件，用于 Rollback 和早期冲突检测
+- **MarkerType**：Marker 类型枚举，包括 DIRECT（直接文件系统）和 TIMELINE_SERVER_BASED（Timeline Server）
+- **WriteMarkers**：Marker 操作抽象基类，定义了 create / exists / delete 等方法
+- **DirectWriteMarkers**：直接在文件系统上创建 Marker 文件
+- **TimelineServerBasedWriteMarkers**：通过 Timeline Server 集中管理 Marker
+- **IOType**：Marker 的操作类型，包括 CREATE（新文件）、MERGE（合并写入）、APPEND（日志追加）
+
+**概念之间的关系**：
+```
+Marker 机制体系:
+  WriteMarkers (抽象基类)
+    ├── create(partitionPath, fileName, IOType) — 创建 Marker
+    ├── exists(partitionPath, fileName, IOType) — 检查 Marker 是否存在
+    ├── delete(partitionPath, fileName, IOType) — 删除 Marker
+    └── allMarkerFilePaths() — 获取所有 Marker 文件路径
+
+  DirectWriteMarkers (直接文件系统)
+    ├── Marker 路径：.hoodie/.temp/<instant>/<partition>/<file>.marker.<IOType>
+    ├── 优点：实现简单，无需中心化服务
+    └── 缺点：S3 上性能差（大量小文件）
+
+  TimelineServerBasedWriteMarkers (Timeline Server)
+    ├── Marker 存储：Timeline Server 内存 + 少量底层文件
+    ├── 优点：减少文件系统操作，性能高
+    └── 缺点：依赖 Timeline Server 可用性
+
+  WriteMarkersFactory (工厂类)
+    ├── 根据 MarkerType 创建对应的 WriteMarkers 实例
+    ├── 自动降级：Timeline Server 不可用时降级到 DIRECT
+    └── HDFS 特殊处理：HDFS 上强制使用 DIRECT
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi Marker | Iceberg | Delta Lake | PostgreSQL WAL |
+|------|-------------|---------|------------|----------------|
+| 写入追踪 | Marker 文件 | 无 | 无 | WAL 日志 |
+| Rollback | 通过 Marker 识别文件 | 删除 Manifest | 删除 Delta Log | WAL 回放 |
+| 早期冲突检测 | 支持 | 不支持 | 不支持 | 锁机制 |
+
+### 15.0.4 设计理念
+
+**为什么这样设计**：
+- **Marker 文件作为写入追踪**：Marker 文件不仅用于 Rollback，还用于早期冲突检测，一举两得
+- **两种 Marker 策略**：DIRECT 策略适合 HDFS（小文件不是问题），TIMELINE_SERVER_BASED 策略适合 S3（减少文件系统操作）
+- **自动降级机制**：Timeline Server 不可用时自动降级到 DIRECT，保证写入的可用性
+
+**设计权衡**：
+- **Marker 文件的开销 vs Rollback 性能**：Marker 文件增加了写入开销，但大幅提升了 Rollback 性能（从全表扫描到精确删除）
+- **DIRECT vs TIMELINE_SERVER_BASED**：DIRECT 实现简单但性能差，TIMELINE_SERVER_BASED 性能高但依赖外部服务
+- **Marker 文件的清理时机**：Marker 文件在 commit 成功后清理，如果 commit 失败，需要通过 Rollback 清理
+
+**架构演进历史**：
+- **0.x 早期**：只有 DIRECT Marker 策略
+- **0.9.0 引入 Timeline Server**：引入 TIMELINE_SERVER_BASED 策略，优化 S3 上的性能
+- **1.x 演进**：Marker 机制与早期冲突检测解耦，Marker 成为独立的写入追踪机制
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 没有 Marker 机制，Rollback 需要扫描文件系统
+- **vs Delta Lake**：Delta Lake 也没有 Marker 机制
+- **vs PostgreSQL WAL**：PostgreSQL 的 WAL 是预写日志，用于故障恢复，而 Hudi 的 Marker 是写入追踪，用于 Rollback
 
 ### 15.1 为什么需要 Marker？
 
@@ -1276,6 +2566,106 @@ public static WriteMarkers get(MarkerType markerType, HoodieTable table, String 
 ---
 
 ## 16. Savepoint 和 Restore 机制深度解析
+
+### 16.0.1 解决什么问题
+
+**核心业务问题**：
+- **数据回滚需求**：生产环境出现数据质量问题，如何快速回滚到之前的正确状态？
+- **数据保护**：如何防止重要的历史数据被 Clean 服务误删？
+- **版本管理**：如何标记和管理表的重要版本（如发布版本、里程碑版本）？
+
+**如果没有 Savepoint 机制会怎样**：
+- 数据质量问题只能通过重新计算修复，无法快速回滚
+- Clean 服务可能删除重要的历史数据，导致无法恢复
+- 无法标记和管理表的重要版本
+
+**实际应用场景**：
+- **发布前保存点**：在重大数据更新前创建 Savepoint，如果更新出现问题可以快速回滚
+- **合规审计**：为满足合规要求，标记某些时间点的数据为不可删除
+- **A/B 测试**：创建 Savepoint 后进行 A/B 测试，测试失败可以回滚
+
+### 16.0.2 有什么坑
+
+**常见误区**：
+- **误以为 Savepoint 是数据副本**：Savepoint 只是元数据标记，不是数据的物理副本
+- **忽略 Savepoint 的存储成本**：Savepoint 会阻止 Clean 服务清理过期文件，导致存储成本增加
+- **混淆 Savepoint 和 Snapshot**：Savepoint 是 Hudi 的概念，Snapshot 是 Iceberg 的概念，两者不同
+
+**容易踩的坑**：
+- **Savepoint 时间点已被 Clean**：如果要 savepoint 的时间点已经被 Clean 清理过了，savepoint 会失败
+- **Restore 的性能开销**：Restore 需要逐个 rollback 多个 commit，如果 commit 数量多，性能开销大
+- **Savepoint 未删除**：Savepoint 创建后如果不删除，会永久阻止 Clean 服务清理文件，导致存储成本持续增加
+
+**生产环境注意事项**：
+- **Savepoint 的生命周期管理**：定期检查和删除不再需要的 Savepoint
+- **Restore 的测试**：Restore 操作是破坏性的，需要在测试环境充分测试
+- **Savepoint 的监控**：监控 Savepoint 的数量和存储占用，及时发现异常
+
+### 16.0.3 核心概念解释
+
+**关键术语**：
+- **Savepoint**：标记一个 commit 时间点为"不可清理"，记录该时间点所有分区的所有文件列表
+- **Restore**：将表回滚到指定的 Savepoint 时间点，逐个 rollback 掉 savepoint 之后的所有 commit
+- **SavepointActionExecutor**：Savepoint 操作的执行器，负责收集文件列表并写入元数据
+- **RestorePlanActionExecutor**：Restore 计划的执行器，负责制定 rollback 计划
+- **BaseRestoreActionExecutor**：Restore 操作的执行器，负责执行 rollback 计划
+
+**概念之间的关系**：
+```
+Savepoint + Restore 机制:
+  Savepoint (创建保存点)
+    ├── 收集该时间点的所有文件列表
+    ├── 写入 savepoint 元数据到 Timeline
+    ├── 阻止 Clean 服务清理该时间点及之后的文件
+    └── 轻量级操作（只写元数据）
+
+  Restore (恢复到保存点)
+    ├── 阶段 1：RestorePlanActionExecutor (制定计划)
+    │   ├── 先回滚 pending clustering instant
+    │   ├── 再回滚其他 commit instant
+    │   └── 生成 restore plan
+    ├── 阶段 2：BaseRestoreActionExecutor (执行计划)
+    │   ├── 逐个 rollback 每个 instant
+    │   ├── 删除数据文件
+    │   ├── 更新 Metadata Table
+    │   └── 清理残留 rollback instant
+    └── 重量级操作（需要删除大量文件）
+
+  Clean 服务与 Savepoint 的交互:
+    Clean 服务检查 Timeline 中的 savepoint
+    → 不清理 savepoint 时间点及之后的文件
+    → 只清理 savepoint 之前的过期版本
+```
+
+**与其他系统的对比**：
+| 维度 | Hudi Savepoint | Iceberg Snapshot | Delta Lake Checkpoint | PostgreSQL Savepoint |
+|------|----------------|------------------|----------------------|----------------------|
+| 本质 | 元数据标记 | 数据快照 | 事务日志检查点 | 事务内保存点 |
+| 存储开销 | 低（只有元数据）| 低（共享数据文件）| 低（只有日志）| 无 |
+| 回滚方式 | 逐个 rollback | 切换 Snapshot | 重放 Delta Log | ROLLBACK TO |
+| 生命周期 | 手动管理 | 自动过期 | 自动过期 | 事务结束自动释放 |
+
+### 16.0.4 设计理念
+
+**为什么这样设计**：
+- **轻量级 Savepoint**：Savepoint 只记录文件列表元数据，不复制数据文件，创建开销极小
+- **精确 Restore**：Restore 通过逆序 rollback 每个 commit，而不是简单地"删除 savepoint 之后的所有文件"，这确保了 Metadata Table 的一致性
+- **Pending Clustering 优先回滚**：Clustering 操作会替换 FileGroup，如果不先回滚 Clustering，后续回滚普通 commit 时可能找不到原始 FileGroup
+
+**设计权衡**：
+- **轻量级创建 vs 重量级恢复**：Savepoint 创建轻量，但 Restore 需要逐个 rollback，如果 commit 数量多，性能开销大
+- **元数据标记 vs 数据副本**：Savepoint 是元数据标记，不是数据副本，这降低了存储成本，但也意味着 Savepoint 依赖原始数据文件的存在
+- **手动管理 vs 自动过期**：Savepoint 需要手动删除，这增加了运维负担，但也给用户更多控制权
+
+**架构演进历史**：
+- **0.x 早期**：只有 Rollback 机制，没有 Savepoint
+- **0.7.0 引入 Savepoint**：引入 Savepoint 和 Restore 机制
+- **1.x 演进**：优化 Restore 性能，支持并行 rollback
+
+**与业界方案对比**：
+- **vs Iceberg**：Iceberg 的 Snapshot 是数据快照，可以直接切换，而 Hudi 的 Savepoint 是元数据标记，需要通过 Restore 回滚
+- **vs Delta Lake**：Delta Lake 的 Checkpoint 是事务日志检查点，用于加速查询，而 Hudi 的 Savepoint 是数据保护机制
+- **vs 传统数据库**：传统数据库的 Savepoint 是事务内保存点，而 Hudi 的 Savepoint 是表级保存点
 
 ### 16.1 Savepoint 的定位
 
